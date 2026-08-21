@@ -162,7 +162,12 @@ game.DescendantAdded:Connect(function(inst)
 end)
 
 -- ===== Outgoing hook: catches ALL FireServer/InvokeServer game-wide =====
+-- Capability check: some executors lost hook support after Roblox updates.
+local HAS_NAMECALL_HOOK = type(hookmetamethod) == "function" and type(getnamecallmethod) == "function"
+local HAS_CONNECTIONS = type(getconnections) == "function"
+
 local old_namecall
+if HAS_NAMECALL_HOOK then
 old_namecall = hookmetamethod(game, "__namecall", function(self, ...)
     local method = getnamecallmethod()
     local is_outgoing = (method == "FireServer" and self:IsA("RemoteEvent"))
@@ -189,7 +194,7 @@ old_namecall = hookmetamethod(game, "__namecall", function(self, ...)
     end
     return old_namecall(self, ...)
 end)
-
+end
 -- ===== Startup =====
 task.spawn(function()
     if not game:IsLoaded() then game.Loaded:Wait() end
@@ -201,6 +206,12 @@ task.spawn(function()
     emit("  Game: " .. game.Name .. " (PlaceId " .. game.PlaceId .. ")")
     emit("  Remotes hooked: " .. found)
     emit("  Log file: " .. (logfile or "console only"))
+    if HAS_NAMECALL_HOOK then
+        emit("  Outgoing capture: ACTIVE (namecall hook)")
+    else
+        emit("  Outgoing capture: UNAVAILABLE (executor has no namecall hook)")
+        emit("  -> Incoming [IN] traffic + full remote discovery still work")
+    end
     emit("  Play normally — all traffic is logged.")
     emit("========================================")
 
