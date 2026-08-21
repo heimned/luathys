@@ -122,6 +122,8 @@ class LuathysApp(QMainWindow):
         self.output_dir = DEFAULT_OUTPUT_DIR
         self.results = []
         self.scanning = False
+        self.timeline = None
+        self.log_output = None
         self.build_ui()
         self.setup_tray()
 
@@ -257,9 +259,9 @@ class LuathysApp(QMainWindow):
         self.tray.show()
 
     def log(self, msg, entry_type="info"):
-        if self.timeline:
+        if getattr(self, "timeline", None):
             self.timeline.add_log(msg, entry_type)
-        else:
+        elif getattr(self, "log_output", None):
             ts = time.strftime("%H:%M:%S")
             self.log_output.append(f"[{ts}] {msg}")
             self.log_output.moveCursor(QTextCursor.MoveOperation.End)
