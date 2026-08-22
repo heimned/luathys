@@ -1,10 +1,10 @@
 --[[
-    Luathys Remote Spy v1.0 — Passive
+    Luathys Remote Spy v1.0 - Passive
     Auto-discovers ALL remotes game-wide and logs traffic in both directions.
     You do nothing: run it, play the game, watch the log.
 
     Outgoing: hookmetamethod __namecall (catches every FireServer/InvokeServer
-              the game client itself makes — no user input required)
+              the game client itself makes - no user input required)
     Incoming: OnClientEvent connected on every discovered RemoteEvent
 
     Output: console + HUKI/Spy/{Game}_{PlaceId}_spy.log
@@ -202,7 +202,7 @@ task.spawn(function()
 
     local found = scan_all()
     emit("========================================")
-    emit("  Luathys Remote Spy v1.0 — passive")
+    emit("  Luathys Remote Spy v1.0 - passive")
     emit("  Game: " .. game.Name .. " (PlaceId " .. game.PlaceId .. ")")
     emit("  Remotes hooked: " .. found)
     emit("  Log file: " .. (logfile or "console only"))
@@ -212,7 +212,7 @@ task.spawn(function()
         emit("  Outgoing capture: UNAVAILABLE (executor has no namecall hook)")
         emit("  -> Incoming [IN] traffic + full remote discovery still work")
     end
-    emit("  Play normally — all traffic is logged.")
+    emit("  Play normally - all traffic is logged.")
     emit("========================================")
 
     -- Re-scan periodically for streamed-in remotes, report stats

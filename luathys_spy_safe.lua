@@ -1,4 +1,4 @@
--- Luathys Remote Spy (Safe Mode) v1.2 — HOOK-FREE
+-- Luathys Remote Spy (Safe Mode) v1.2 - HOOK-FREE
 -- Class-method hooking breaks CoreGui on some executors, so this version
 -- uses NO hooks at all: passive discovery + incoming traffic only.
 -- Outgoing protocol is learned by firing remotes manually and watching [IN] responses.
