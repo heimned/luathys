@@ -9,6 +9,8 @@ local CONFIG = {
     SUPPRESS_DUPES = true,
 }
 
+local safe = function(f, ...) return pcall(f, ...) end
+
 local function truncate(s)
     s = tostring(s)
     if #s > 300 then return s:sub(1, 300) .. "...(" .. #s .. " chars)" end
@@ -33,9 +35,9 @@ local function serialize(v, depth)
             parts[n] = key .. "=" .. serialize(val, depth + 1)
         end
         return "{" .. table.concat(parts, ",") .. "}"
-    elseif t == "Vector3" then return "Vec3(" .. tostring(v.X) .. "," .. tostring(v.Y) .. "," .. tostring(v.Z) .. ")"
-    elseif t == "CFrame" then local p = v.Position; return "CF(" .. tostring(p.X) .. "," .. tostring(p.Y) .. "," .. tostring(p.Z) .. ")"
-    elseif t == "Color3" then return "Clr(" .. tostring(v.R*255) .. "," .. tostring(v.G*255) .. "," .. tostring(v.B*255) .. ")"
+    elseif t == "Vector3" then return "Vec3("..tostring(v.X)..","..tostring(v.Y)..","..tostring(v.Z)..")"
+    elseif t == "CFrame" then local p = v.Position; return "CF("..tostring(p.X)..","..tostring(p.Y)..","..tostring(p.Z)..")"
+    elseif t == "Color3" then return "Clr("..tostring(v.R*255)..","..tostring(v.G*255)..","..tostring(v.B*255)..")"
     elseif t == "nil" then return "nil"
     end
     return t .. "(" .. truncate(v) .. ")"
@@ -87,11 +89,12 @@ local function is_game_remote(obj)
     if cn ~= "RemoteEvent" and cn ~= "RemoteFunction" and cn ~= "UnreliableRemoteEvent" then
         return false
     end
+    -- Exclude CoreGui remotes
     local exclude = false
     pcall(function()
         local parent = obj
         while parent do
-            if parent == game:GetService("CoreGui") then
+            if parent:IsA("CoreGui") or parent == game:GetService("CoreGui") then
                 exclude = true
                 break
             end
@@ -101,6 +104,7 @@ local function is_game_remote(obj)
     return not exclude
 end
 
+-- Incoming traffic logger
 local function hook_incoming(inst)
     if remotes[inst] then return end
     remotes[inst] = true
@@ -123,6 +127,7 @@ local function hook_incoming(inst)
     end
 end
 
+-- Remote discovery
 local function discover_remotes()
     local count = 0
     pcall(function()
@@ -133,6 +138,7 @@ local function discover_remotes()
             end
         end
     end)
+    -- Nil instances
     pcall(function()
         if getnilinstances then
             for _, obj in ipairs(getnilinstances()) do
@@ -146,120 +152,86 @@ local function discover_remotes()
     return count
 end
 
--- Outgoing capture via hookfunction on class methods
+-- Outgoing capture via hookfunction (works where hookmetamethod doesn't)
 local function setup_outgoing_hook()
-    if typeof(hookfunction) ~= "function" then
+    local has_hook = typeof(hookfunction) == "function"
+    if not has_hook then
         emit("hookfunction NOT available - outgoing capture disabled")
         return false
     end
 
-    local ok_re = false
-    local ok_rf = false
+    local has_success = {}
 
-    -- Hook RemoteEvent.FireServer (class-wide, self identifies the remote)
+    -- Hook RemoteEvent.FireServer
+    local re_ok, re_orig = pcall(function()
+        return game:GetService("ReplicatedStorage").WaitForChild("TestRemote").FireServer
+    end)
+
+    -- Hook all RemoteEvent.FireServer calls globally
     pcall(function()
-        local probe = Instance.new("RemoteEvent")
-        local old = hookfunction(probe.FireServer, function(self, ...)
+        local re_cls = Instance.new("RemoteEvent")
+        local old = hookfunction(re_cls.FireServer, function(self, ...)
             if typeof(self) == "Instance" and is_game_remote(self) then
-                local ok, args = pcall(function() return table.pack(...) end)
-                if ok then
-                    stats.outgoing = stats.outgoing + 1
-                    local sig = self:GetFullName() .. serialize_args(args)
-                    if CONFIG.SUPPRESS_DUPES and last_sig[self] == sig then
-                        stats.dupes = stats.dupes + 1
-                    else
-                        last_sig[self] = sig
-                        emit(os.date("%H:%M:%S") .. " [OUT] " .. self:GetFullName() .. " FireServer " .. serialize_args(args))
-                    end
+                local args = table.pack(...)
+                stats.outgoing = stats.outgoing + 1
+                local sig = self:GetFullName() .. serialize_args(args)
+                if CONFIG.SUPPRESS_DUPES and last_sig[self] == sig then
+                    stats.dupes = stats.dupes + 1
+                else
+                    last_sig[self] = sig
+                    emit(os.date("%H:%M:%S") .. " [OUT] " .. self:GetFullName() .. " " .. serialize_args(args))
                 end
             end
             return old(self, ...)
         end)
-        ok_re = typeof(old) == "function"
-        probe:Destroy()
+        has_success["RemoteEvent"] = typeof(old) == "function"
     end)
 
     -- Hook RemoteFunction.InvokeServer
     pcall(function()
-        local probe = Instance.new("RemoteFunction")
-        local old = hookfunction(probe.InvokeServer, function(self, ...)
+        local rf_cls = Instance.new("RemoteFunction")
+        local old = hookfunction(rf_cls.InvokeServer, function(self, ...)
             if typeof(self) == "Instance" and is_game_remote(self) then
-                local ok, args = pcall(function() return table.pack(...) end)
-                if ok then
-                    stats.outgoing = stats.outgoing + 1
-                    local sig = self:GetFullName() .. ":InvokeServer"
-                    if CONFIG.SUPPRESS_DUPES and last_sig[self] == sig then
-                        stats.dupes = stats.dupes + 1
-                    else
-                        last_sig[self] = sig
-                        emit(os.date("%H:%M:%S") .. " [OUT] " .. self:GetFullName() .. " InvokeServer " .. serialize_args(args))
-                    end
-                end
+                local args = table.pack(...)
+                stats.outgoing = stats.outgoing + 1
+                emit(os.date("%H:%M:%S") .. " [OUT] " .. self:GetFullName() .. " InvokeServer " .. serialize_args(args))
             end
             return old(self, ...)
         end)
-        ok_rf = typeof(old) == "function"
-        probe:Destroy()
+        has_success["RemoteFunction"] = typeof(old) == "function"
     end)
 
-    if ok_re then emit("Outgoing RemoteEvent.FireServer: hooked") end
-    if ok_rf then emit("Outgoing RemoteFunction.InvokeServer: hooked") end
-
-    if not (ok_re or ok_rf) then
-        emit("Outgoing capture: hookfunction hooks rejected")
-        emit("  -> Incoming + discovery still fully active")
+    local active = has_success["RemoteEvent"] or has_success["RemoteFunction"]
+    if active then
+        emit("Outgoing capture: ACTIVE (via hookfunction)")
+    else
+        emit("Outgoing capture: FAILED (hookfunction hook rejected by Roblox)")
+        emit("  -> You will still get full incoming + remote discovery")
     end
-    return ok_re or ok_rf
+    return active
 end
 
+-- Auto-rescan for new remotes
 local function setup_autoscan()
     pcall(function()
         game.DescendantAdded:Connect(function(obj)
-            task.defer(function()
-                pcall(function()
-                    if is_game_remote(obj) then
-                        hook_incoming(obj)
-                        emit(os.date("%H:%M:%S") .. " [+] New remote: " .. obj:GetFullName())
-                    end
-                end)
+            wait()
+            pcall(function()
+                if is_game_remote(obj) then
+                    hook_incoming(obj)
+                    emit(os.date("%H:%M:%S") .. " [+] New remote: " .. obj:GetFullName())
+                end
             end)
         end)
     end)
 end
 
+-- Main
 local function main()
     setup_logger()
 
+    -- Wait for game
     pcall(function()
         if not game:IsLoaded() then game.Loaded:Wait() end
     end)
-    task.wait(2)
-
-    emit("========================================")
-    emit("  Luathys Remote Spy (Safe Mode) v1.1")
-    local placeName = "Unknown"
-    pcall(function() placeName = game.Name end)
-    emit("  Game: " .. placeName .. " (PlaceId " .. tostring(game.PlaceId) .. ")")
-
-    local found = discover_remotes()
-    emit("  Remotes discovered: " .. found)
-    setup_outgoing_hook()
-    setup_autoscan()
-    emit("  Log: " .. tostring(logfile or "console only"))
-    emit("  Play normally. All traffic is logged.")
-    emit("========================================")
-
-    while true do
-        task.wait(60)
-        local total = 0
-        for _ in pairs(remotes) do total = total + 1 end
-        emit("STATS | remotes=" .. total .. " outgoing=" .. stats.outgoing .. " incoming=" .. stats.incoming .. " dupes=" .. stats.dupes)
-    end
-end
-
-if not _G.__luathys_spy_loaded then
-    _G.__luathys_spy_loaded = true
-    pcall(main)
-else
-    print("Luathys spy already loaded")
-end
+    wait
