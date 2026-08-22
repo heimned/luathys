@@ -1,5 +1,5 @@
 --[[
-    Luathys Enhanced Dumper v2.3
+    Luathys Enhanced Dumper v2.4
     - Progress output per script (no more silent hangs)
     - External-API fallback DISABLED by default (it had no timeout and
       stalled dumps for minutes) - opt in with _G.LUATHYS_USE_API = true
@@ -21,13 +21,12 @@ local success, err = pcall(function()
 
     local placeId = game.PlaceId or 0
     local placeName = (game.Name or "Game"):gsub("[^%w_-]", "_")
-    local outRoot = "HUKI/" .. placeName .. "_" .. placeId
+    local outRoot = placeName .. "_" .. placeId
 
-    safe(makefolder, "HUKI")
     safe(makefolder, outRoot)
 
     local USE_API = (_G.LUATHYS_USE_API == true)
-    print("=== Luathys Enhanced Dumper v2.3 ===")
+    print("=== Luathys Enhanced Dumper v2.4 ===")
     print("Game: " .. game.Name .. " (PlaceId: " .. placeId .. ")")
     print("External API fallback: " .. (USE_API and "ON" or "OFF (set _G.LUATHYS_USE_API=true to enable)"))
 
@@ -36,7 +35,7 @@ local success, err = pcall(function()
     local seenScripts = setmetatable({}, {__mode = "k"})
 
     safe(writefile, outRoot .. "/_summary.txt",
-        "-- Luathys v2.3 Dump\n-- Game: " .. game.Name .. "\n-- PlaceId: " .. placeId .. "\n-- Time: " .. os.date("%Y-%m-%d %H:%M:%S") .. "\n")
+        "-- Luathys v2.4 Dump\n-- Game: " .. game.Name .. "\n-- PlaceId: " .. placeId .. "\n-- Time: " .. os.date("%Y-%m-%d %H:%M:%S") .. "\n")
 
     local function uniquePath(dir, baseName, cls)
         baseName = baseName:gsub("[^%w _%-]", "_")
@@ -252,7 +251,7 @@ local success, err = pcall(function()
     end
 
     safe(writefile, outRoot .. "/_summary.txt",
-        "-- Luathys v2.3 Dump Complete\n"
+        "-- Luathys v2.4 Dump Complete\n"
         .. "-- Game: " .. game.Name .. "\n"
         .. "-- PlaceId: " .. placeId .. "\n"
         .. "-- Success: " .. totalSuccess .. "\n"
