@@ -1,46 +1,17 @@
---[[
-    Luathys Remote Spy (Hardened) — v1.0-safe
-    Bulletproof version: every API call is pcall-guarded so one missing
-    function won't crash the whole thing. CoreGui is never touched.
---]]
+-- Luathys Remote Spy (Safe Mode) v1.1
+-- For executors with hookfunction but no hookmetamethod.
+-- Hooks RemoteEvent.FireServer and RemoteFunction.InvokeServer directly.
 
 local CONFIG = {
     LOG_TO_FILE = true,
     LOG_PATH = "HUKI/Spy",
+    MAX_ARG_DEPTH = 4,
     SUPPRESS_DUPES = true,
 }
 
--- Safe wrappers
-local function safe(fn, ...)
-    local ok, res = pcall(fn, ...)
-    return ok and res
-end
-
-local function makefolder_safe(name)
-    return safe(makefolder, name) or safe(makefile, name) or false
-end
-
-local function writefile_safe(name, content)
-    local dirs = {}
-    for pathPart in string.gmatch(name, "[^/]+") do
-        table.insert(dirs, pathPart)
-        if #dirs > 1 then
-            local dirPath = table.concat(dirs, "/")
-            makefolder_safe(dirPath)
-            table.remove(dirs, #dirs)
-        end
-    end
-    return safe(writefile, name, content)
-end
-
-local function appendfile_safe(name, content)
-    return safe(appendfile, name, content)
-end
-
--- String utilities
 local function truncate(s)
     s = tostring(s)
-    if #s > 200 then return s:sub(1, 200) .. "...(" .. tostring(#s) .. " chars)" end
+    if #s > 300 then return s:sub(1, 300) .. "...(" .. #s .. " chars)" end
     return s
 end
 
@@ -53,71 +24,81 @@ local function serialize(v, depth)
         local ok, path = pcall(function() return v:GetFullName() end)
         return (ok and path) or "Instance(dead)"
     elseif t == "table" then
-        if depth >= 4 then return "{...}" end
-        local parts = {}
-        local n = 0
+        if depth >= CONFIG.MAX_ARG_DEPTH then return "{...}" end
+        local parts, n = {}, 0
         for k, val in pairs(v) do
             n = n + 1
-            if n > 15 then parts[n] = "..."; break end
-            local key = (typeof(k) == "string") and k or ("[" .. serialize(k, depth+1) .. "]")
-            parts[n] = key .. "=" .. serialize(val, depth+1)
+            if n > 20 then parts[n] = "..."; break end
+            local key = (typeof(k) == "string") and k or ("[" .. tostring(k) .. "]")
+            parts[n] = key .. "=" .. serialize(val, depth + 1)
         end
         return "{" .. table.concat(parts, ",") .. "}"
-    elseif t == "Vector3" then return "Vec3("..v.X..","..v.Y..","..v.Z..")"
-    elseif t == "CFrame" then local p=v.Position; return "CF("..p.X..","..p.Y..","..p.Z..")"
-    elseif t == "Color3" then return "Clr("..v.R*255..","..v.G*255..","..v.B*255..")"
+    elseif t == "Vector3" then return "Vec3(" .. tostring(v.X) .. "," .. tostring(v.Y) .. "," .. tostring(v.Z) .. ")"
+    elseif t == "CFrame" then local p = v.Position; return "CF(" .. tostring(p.X) .. "," .. tostring(p.Y) .. "," .. tostring(p.Z) .. ")"
+    elseif t == "Color3" then return "Clr(" .. tostring(v.R*255) .. "," .. tostring(v.G*255) .. "," .. tostring(v.B*255) .. ")"
+    elseif t == "nil" then return "nil"
     end
     return t .. "(" .. truncate(v) .. ")"
 end
 
 local function serialize_args(args)
-    if not args or #args == 0 then return "()" end
+    if not args then return "()" end
     local parts = {}
-    for i = 1, #args do
+    for i = 1, math.min(#args, 12) do
         parts[i] = serialize(args[i], 0)
     end
+    if #args > 12 then parts[#parts+1] = "..." end
     return "(" .. table.concat(parts, ",") .. ")"
 end
 
--- Logging
 local logfile = nil
 local function emit(line)
     print(line)
-    if logfile then appendfile_safe(logfile, line .. "\n") end
+    if logfile then
+        pcall(function() appendfile(logfile, line .. "\n") end)
+    end
 end
 
--- File setup
 local function setup_logger()
     if not CONFIG.LOG_TO_FILE then return end
-    local placeName = safe(function() return game.Name end) or "Game"
-    placeName = placeName:gsub("[^%w_]", "_")
-    local placeId = safe(function() return game.PlaceId end) or 0
+    local placeName = "Game"
+    local placeId = 0
+    pcall(function()
+        placeName = game.Name:gsub("[^%w_]", "_")
+        placeId = game.PlaceId
+    end)
     logfile = CONFIG.LOG_PATH .. "/" .. placeName .. "_" .. placeId .. "_spy.log"
 
-    makefolder_safe("HUKI")
-    makefolder_safe(CONFIG.LOG_PATH)
-    writefile_safe(logfile, "--- Luathys Remote Spy " .. os.date("%Y-%m-%d %H:%M:%S") .. " ---\n")
+    pcall(function() makefolder("HUKI") end)
+    pcall(function() makefolder(CONFIG.LOG_PATH) end)
+    pcall(function()
+        writefile(logfile, "--- Luathys Remote Spy " .. os.date("%Y-%m-%d %H:%M:%S") .. " ---\n")
+    end)
 end
 
--- Remote discovery + hooking
+-- State
 local remotes = {}
-local stats = { out = 0, in = 0, dupes = 0 }
+local stats = { outgoing = 0, incoming = 0, dupes = 0 }
 local last_sig = {}
 
-local function is_remote(obj)
+local function is_game_remote(obj)
     if not obj or not obj.ClassName then return false end
-    -- ONLY non-CoreGui remotes
-    if obj:IsA("RemoteEvent") or obj:IsA("RemoteFunction")
-       or obj:IsA("UnreliableRemoteEvent") then
-        local parent = safe(function() return obj.Parent end)
-        if parent then
-            local ok, isCore = pcall(function() return parent == game:GetService("CoreGui") end)
-            if not isCore and not ok then isCore = false end
-            return not isCore
-        end
+    local cn = obj.ClassName
+    if cn ~= "RemoteEvent" and cn ~= "RemoteFunction" and cn ~= "UnreliableRemoteEvent" then
         return false
     end
-    return false
+    local exclude = false
+    pcall(function()
+        local parent = obj
+        while parent do
+            if parent == game:GetService("CoreGui") then
+                exclude = true
+                break
+            end
+            parent = parent.Parent
+        end
+    end)
+    return not exclude
 end
 
 local function hook_incoming(inst)
@@ -125,11 +106,11 @@ local function hook_incoming(inst)
     remotes[inst] = true
 
     if inst:IsA("RemoteEvent") and inst.OnClientEvent then
-        safe(function()
+        pcall(function()
             inst.OnClientEvent:Connect(function(...)
                 local ok, args = pcall(function() return table.pack(...) end)
                 if not ok then return end
-                stats.in_ = stats.in_ + 1
+                stats.incoming = stats.incoming + 1
                 local sig = inst:GetFullName() .. serialize_args(args)
                 if CONFIG.SUPPRESS_DUPES and last_sig[inst] == sig then
                     stats.dupes = stats.dupes + 1
@@ -144,108 +125,138 @@ end
 
 local function discover_remotes()
     local count = 0
-    safe(function()
+    pcall(function()
         for _, obj in ipairs(game:GetDescendants()) do
-            if is_remote(obj) then
+            if is_game_remote(obj) then
                 count = count + 1
                 hook_incoming(obj)
             end
         end
     end)
-
-    -- nil instances
-    safe(function()
+    pcall(function()
         if getnilinstances then
             for _, obj in ipairs(getnilinstances()) do
-                if is_remote(obj) then
+                if is_game_remote(obj) then
                     count = count + 1
                     hook_incoming(obj)
                 end
             end
         end
     end)
-
     return count
 end
 
--- Outgoing hook (guarded)
+-- Outgoing capture via hookfunction on class methods
 local function setup_outgoing_hook()
-    local has_hook = type(hookmetamethod) == "function" and type(getnamecallmethod) == "function"
-
-    if not has_hook then
-        emit("Outgoing capture UNAVAILABLE (no hookmetamethod). Only incoming logged.")
+    if typeof(hookfunction) ~= "function" then
+        emit("hookfunction NOT available - outgoing capture disabled")
         return false
     end
 
-    local orig = hookmetamethod(game, "__namecall", function(self, ...)
-        local ok, method = pcall(getnamecallmethod)
-        if not ok then method = nil end
+    local ok_re = false
+    local ok_rf = false
 
-        if is_remote(self) and (method == "FireServer" or method == "InvokeServer") then
-            local ok2, args = pcall(function() return table.pack(...) end)
-            if ok2 then
-                stats.out = stats.out + 1
-                local sig = self:GetFullName() .. ":" .. (method or "?") .. serialize_args(args)
-                if CONFIG.SUPPRESS_DUPES and last_sig[self] == sig then
-                    stats.dupes = stats.dupes + 1
-                    return orig(self, ...)
+    -- Hook RemoteEvent.FireServer (class-wide, self identifies the remote)
+    pcall(function()
+        local probe = Instance.new("RemoteEvent")
+        local old = hookfunction(probe.FireServer, function(self, ...)
+            if typeof(self) == "Instance" and is_game_remote(self) then
+                local ok, args = pcall(function() return table.pack(...) end)
+                if ok then
+                    stats.outgoing = stats.outgoing + 1
+                    local sig = self:GetFullName() .. serialize_args(args)
+                    if CONFIG.SUPPRESS_DUPES and last_sig[self] == sig then
+                        stats.dupes = stats.dupes + 1
+                    else
+                        last_sig[self] = sig
+                        emit(os.date("%H:%M:%S") .. " [OUT] " .. self:GetFullName() .. " FireServer " .. serialize_args(args))
+                    end
                 end
-                last_sig[self] = sig
-                emit(os.date("%H:%M:%S") .. " [OUT] " .. self:GetFullName() .. " : " .. (method or "?") .. " " .. serialize_args(args))
             end
-        end
-        return orig(self, ...)
+            return old(self, ...)
+        end)
+        ok_re = typeof(old) == "function"
+        probe:Destroy()
     end)
 
-    if type(orig) == "function" then
-        emit("Outgoing capture: ACTIVE")
-        return true
-    else
-        emit("Outgoing hook failed silently")
-        return false
+    -- Hook RemoteFunction.InvokeServer
+    pcall(function()
+        local probe = Instance.new("RemoteFunction")
+        local old = hookfunction(probe.InvokeServer, function(self, ...)
+            if typeof(self) == "Instance" and is_game_remote(self) then
+                local ok, args = pcall(function() return table.pack(...) end)
+                if ok then
+                    stats.outgoing = stats.outgoing + 1
+                    local sig = self:GetFullName() .. ":InvokeServer"
+                    if CONFIG.SUPPRESS_DUPES and last_sig[self] == sig then
+                        stats.dupes = stats.dupes + 1
+                    else
+                        last_sig[self] = sig
+                        emit(os.date("%H:%M:%S") .. " [OUT] " .. self:GetFullName() .. " InvokeServer " .. serialize_args(args))
+                    end
+                end
+            end
+            return old(self, ...)
+        end)
+        ok_rf = typeof(old) == "function"
+        probe:Destroy()
+    end)
+
+    if ok_re then emit("Outgoing RemoteEvent.FireServer: hooked") end
+    if ok_rf then emit("Outgoing RemoteFunction.InvokeServer: hooked") end
+
+    if not (ok_re or ok_rf) then
+        emit("Outgoing capture: hookfunction hooks rejected")
+        emit("  -> Incoming + discovery still fully active")
     end
+    return ok_re or ok_rf
 end
 
--- Main
+local function setup_autoscan()
+    pcall(function()
+        game.DescendantAdded:Connect(function(obj)
+            task.defer(function()
+                pcall(function()
+                    if is_game_remote(obj) then
+                        hook_incoming(obj)
+                        emit(os.date("%H:%M:%S") .. " [+] New remote: " .. obj:GetFullName())
+                    end
+                end)
+            end)
+        end)
+    end)
+end
+
 local function main()
     setup_logger()
 
-    -- Wait for game
-    safe(function()
+    pcall(function()
         if not game:IsLoaded() then game.Loaded:Wait() end
     end)
-    wait(1)
+    task.wait(2)
 
     emit("========================================")
-    emit("  Luathys Remote Spy (Safe Mode)")
-    emit("  Game: " .. safe(function() return game.Name end) or "Unknown" .. " (PlaceId " .. tostring(safe(function() return game.PlaceId end)) .. ")")
+    emit("  Luathys Remote Spy (Safe Mode) v1.1")
+    local placeName = "Unknown"
+    pcall(function() placeName = game.Name end)
+    emit("  Game: " .. placeName .. " (PlaceId " .. tostring(game.PlaceId) .. ")")
 
     local found = discover_remotes()
     emit("  Remotes discovered: " .. found)
     setup_outgoing_hook()
+    setup_autoscan()
     emit("  Log: " .. tostring(logfile or "console only"))
-    emit("  Play normally. All traffic logged.")
+    emit("  Play normally. All traffic is logged.")
     emit("========================================")
 
-    -- Auto-rescan
-    if game then
-        game:GetPropertyChangedSignal("DescendantAdded"):Connect(function()
-            wait()
-            safe(function()
-                for _, obj in ipairs({game:GetDescendants()[#game:GetDescendants()]}) do
-                    -- This is simplified — full rescan each second
-                end
-            end)
-        end)
-    end
-
     while true do
-        wait(60)
-        emit("STATS | remotes=" .. tostring((function(c=0 for _ in pairs(remotes) do c=c+1 end return c)())) .. " out=" .. stats.out .. " in=" .. stats.in_ .. " dupes=" .. stats.dupes)
+        task.wait(60)
+        local total = 0
+        for _ in pairs(remotes) do total = total + 1 end
+        emit("STATS | remotes=" .. total .. " outgoing=" .. stats.outgoing .. " incoming=" .. stats.incoming .. " dupes=" .. stats.dupes)
     end
 end
 
--- Defer and guard
 if not _G.__luathys_spy_loaded then
     _G.__luathys_spy_loaded = true
     pcall(main)
