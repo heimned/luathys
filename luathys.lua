@@ -78,7 +78,7 @@ local success, err = pcall(function()
     end
 
     local function dumpOne(script, dir, label, idx, total)
-        if seenScripts[script] then return false end
+        if seenScripts[script] then return "dup" end
         seenScripts[script] = true
 
         local fullName = ""
@@ -118,8 +118,11 @@ local success, err = pcall(function()
 
         -- 3) nothing worked - record what we lost
         local pf = uniquePath(dir, script.Name, "_" .. script.ClassName .. "_FAILED.lua")
-        safe(writefile, pf, "-- no bytecode, no source\n-- FullName: " .. fullName .. "\n-- Class: " .. script.ClassName)
-        return false
+        local reason = (script.ClassName == "Script")
+            and "server Script - bytecode is stripped before replication"
+            or "no bytecode and no source available"
+        safe(writefile, pf, "-- " .. reason .. \n-- FullName: " .. fullName .. "\n-- Class: " .. script.ClassName)
+        return "fail"
     end
 
     local function collectInto(container, dir, label)
@@ -141,8 +144,10 @@ local success, err = pcall(function()
         pcall(walk, container)
 
         print("  [" .. label .. "] found " .. #scripts .. " scripts")
+        local dup = 0
         for i, s in ipairs(scripts) do
-            if dumpOne(s, dir, label, i, #scripts) then ok = ok + 1 else fail = fail + 1 end
+            local r = dumpOne(s, dir, label, i, #scripts)
+            if r == true then ok = ok + 1 elseif r == "dup" then dup = dup + 1 else fail = fail + 1 end
         end
 
         local function buildTree(inst, depth)
@@ -220,11 +225,12 @@ local success, err = pcall(function()
         safe(makefolder, dir)
         local mods = safe(getloadedmodules) or {}
         print("  found " .. #mods .. " loaded modules")
-        local s, f = 0, 0
+        local s, f, d = 0, 0, 0
         for i, m in ipairs(mods) do
-            if dumpOne(m, dir, "LoadedModule", i, #mods) then s = s + 1 else f = f + 1 end
+            local r = dumpOne(m, dir, "LoadedModule", i, #mods)
+            if r == true then s = s + 1 elseif r == "dup" then d = d + 1 else f = f + 1 end
         end
-        print("  [LoadedModules] done: " .. s .. " ok, " .. f .. " failed")
+        print("  [LoadedModules] done: " .. s .. " ok, " .. f .. " failed, " .. tostring(d) .. " duplicates")
         totalOk, totalFail = totalOk + s, totalFail + f
     end
 
