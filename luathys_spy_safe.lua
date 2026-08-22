@@ -110,8 +110,7 @@ local function hook_incoming(inst)
     if inst:IsA("RemoteEvent") and inst.OnClientEvent then
         pcall(function()
             inst.OnClientEvent:Connect(function(...)
-                local ok, args = pcall(function() return table.pack(...) end)
-                if not ok then return end
+                local args = table.pack(...)
                 stats.incoming = stats.incoming + 1
                 local sig = inst:GetFullName() .. serialize_args(args)
                 if CONFIG.SUPPRESS_DUPES and last_sig[inst] == sig then

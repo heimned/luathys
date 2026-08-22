@@ -175,8 +175,8 @@ old_namecall = hookmetamethod(game, "__namecall", function(self, ...)
         or (method == "FireServer" and self:IsA("UnreliableRemoteEvent"))
     if is_outgoing then
         if not CONFIG.BLACKLIST[self.Name] then
-            local ok, args = pcall(function() return table.pack(...) end)
-            if ok then
+            local args = table.pack(...)
+            if args then
                 stats.outgoing = stats.outgoing + 1
                 local sig = "OUT|" .. tostring(self) .. "|" .. method .. "|" .. serialize_args(args, 0)
                 if not (CONFIG.SUPPRESS_DUPES and sig == last_sig[self]) then
