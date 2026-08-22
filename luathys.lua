@@ -1,12 +1,18 @@
 --[[
-    Luathys Enhanced Dumper v2.4
-    - Progress output per script (no more silent hangs)
-    - External-API fallback DISABLED by default (it had no timeout and
-      stalled dumps for minutes) - opt in with _G.LUATHYS_USE_API = true
-    - Request timeout of 10s when API fallback is enabled
-    - Per-container elapsed timing
-    - Everything from v2.2: unique paths, getloadedmodules,
-      LocalPlayer containers, nil instances
+    Luathys Enhanced Dumper v2.5 - BYTECODE MODE
+    All remote decompiler APIs are currently dead (lonegladiator 522,
+    cosmic.best DNS-dead = Madium's built-in decompile is broken).
+    So this version dumps RAW BYTECODE for every script - guaranteed
+    to work since getscriptbytecode functions on your executor -
+    plus whatever source/decompile is obtainable locally.
+
+    After dumping, run decompile_all.py (in the same folder as
+    unluau.exe) against the output directory to turn every .luac
+    into readable .lua offline.
+
+    Optional:
+      _G.LUATHYS_API_URL = "https://your-own-decompiler/endpoint"
+        -> also tries this single endpoint (10s timeout) per script
 ]]
 
 local function safe(fn, ...)
@@ -25,60 +31,49 @@ local success, err = pcall(function()
 
     safe(makefolder, outRoot)
 
-    local USE_API = (_G.LUATHYS_USE_API == true)
-    print("=== Luathys Enhanced Dumper v2.4 ===")
+    print("=== Luathys Enhanced Dumper v2.5 (bytecode mode) ===")
     print("Game: " .. game.Name .. " (PlaceId: " .. placeId .. ")")
-    print("External API fallback: " .. (USE_API and "ON" or "OFF (set _G.LUATHYS_USE_API=true to enable)"))
 
-    local totalSuccess, totalFail = 0, 0
+    local apiURL = _G.LUATHYS_API_URL
+    if apiURL then
+        print("Custom API endpoint: " .. tostring(apiURL))
+    else
+        print("No API endpoint set - bytecode-only mode")
+        print("(all public decompiler APIs are currently dead)")
+    end
+
+    local totalOk, totalFail = 0, 0
     local usedPaths = {}
     local seenScripts = setmetatable({}, {__mode = "k"})
 
-    safe(writefile, outRoot .. "/_summary.txt",
-        "-- Luathys v2.4 Dump\n-- Game: " .. game.Name .. "\n-- PlaceId: " .. placeId .. "\n-- Time: " .. os.date("%Y-%m-%d %H:%M:%S") .. "\n")
-
-    local function uniquePath(dir, baseName, cls)
+    local function uniquePath(dir, baseName, ext)
         baseName = baseName:gsub("[^%w _%-]", "_")
         if #baseName > 80 then baseName = baseName:sub(1, 80) end
-        local path = dir .. "/" .. baseName .. "_" .. cls .. ".lua"
+        local path = dir .. "/" .. baseName .. ext
         local n = 1
         while usedPaths[path] do
             n = n + 1
-            path = dir .. "/" .. baseName .. "_" .. cls .. "_" .. n .. ".lua"
+            path = dir .. "/" .. baseName .. "_" .. n .. ext
         end
         usedPaths[path] = true
         return path
     end
 
-    local function decompileScript(script)
-        if typeof(decompile) == "function" then
-            local ok, result = pcall(decompile, script)
-            if ok and type(result) == "string" and #result > 0 then
-                return result
-            end
-        end
-        local ok, src = pcall(function() return script.Source end)
-        if ok and type(src) == "string" and #src > 0 then
-            return src
-        end
-        if USE_API and typeof(getscriptbytecode) == "function" and crypt and request then
-            local okBc, bc = pcall(getscriptbytecode, script)
-            if okBc and bc then
-                local encoded = bc
-                pcall(function() encoded = crypt.base64.encode(bc) end)
-                local okReq, result = pcall(function()
-                    local req = request({
-                        Url = "https://unluau.lonegladiator.dev/unluau/decompile",
-                        Method = "POST",
-                        Body = encoded,
-                        Headers = {["Content-Type"] = "application/octet-stream"},
-                        Timeout = 10,
-                    })
-                    if req and req.Body and #req.Body > 0 then return req.Body end
-                end)
-                if okReq and result then return result end
-            end
-        end
+    local function tryApiDecode(bytecode)
+        if not apiURL or typeof(request) ~= "function" then return nil end
+        local encoded = bytecode
+        pcall(function() encoded = crypt.base64.encode(bytecode) end)
+        local ok, result = pcall(function()
+            local req = request({
+                Url = apiURL,
+                Method = "POST",
+                Body = encoded,
+                Headers = {["Content-Type"] = "application/octet-stream"},
+                Timeout = 10,
+            })
+            if req and req.Body and #req.Body > 0 then return req.Body end
+        end)
+        if ok and result then return result end
         return nil
     end
 
@@ -88,50 +83,55 @@ local success, err = pcall(function()
 
         local fullName = ""
         pcall(function() fullName = script:GetFullName() end)
-
-        if idx and total and idx % 10 == 0 then
+        if idx and total and idx % 25 == 0 then
             print("    [" .. idx .. "/" .. total .. "] " .. fullName)
         end
 
-        local source = decompileScript(script)
-        if not source then
-            source = "-- Failed to decompile (server-side or protected)\n-- FullName: " .. fullName
+        -- 1) best case: readable Source (rare on modern Roblox, but free)
+        local src = safe(function() return script.Source end)
+        if type(src) == "string" and #src > 0 then
+            local p = uniquePath(dir, script.Name, "_" .. script.ClassName .. "_src.lua")
+            local header = "--[[" .. label .. " | " .. fullName .. " | SOURCE ]]\n"
+            if safe(writefile, p, header .. src) then return true end
         end
 
-        local header = table.concat({
-            "--[[",
-            "\tLuathys v2.3",
-            "\tContainer: " .. label,
-            "\tScript: " .. script.Name,
-            "\tPath: " .. fullName,
-            "\tClass: " .. script.ClassName,
-            "]]",
-            "",
-        }, "\n")
-
-        local path = uniquePath(dir, script.Name, script.ClassName)
-        if #path > 240 then
-            path = dir .. "/s_" .. tostring(math.floor(tick() * 1000) % 100000000) .. ".lua"
+        -- 2) bytecode: always save this - it is the durable artifact
+        local bc = nil
+        if typeof(getscriptbytecode) == "function" then
+            local okBc, b = pcall(getscriptbytecode, script)
+            if okBc and type(b) == "string" and #b > 0 then bc = b end
         end
 
-        if safe(writefile, path, header .. source) then
-            return true
+        if bc then
+            local pb = uniquePath(dir, script.Name, "_" .. script.ClassName .. ".luac")
+            safe(writefile, pb, bc)
+
+            -- optional live decode attempt
+            local decoded = tryApiDecode(bc)
+            if decoded then
+                local pl = uniquePath(dir, script.Name, "_" .. script.ClassName .. ".lua")
+                safe(writefile, pl, "--[[" .. label .. " | " .. fullName .. "]]\n" .. decoded)
+                return true
+            end
+            return true  -- bytecode saved counts as success
         end
+
+        -- 3) nothing worked - record what we lost
+        local pf = uniquePath(dir, script.Name, "_" .. script.ClassName .. "_FAILED.lua")
+        safe(writefile, pf, "-- no bytecode, no source\n-- FullName: " .. fullName .. "\n-- Class: " .. script.ClassName)
         return false
     end
 
     local function collectInto(container, dir, label)
         if not container then return 0, 0 end
         local t0 = tick()
-        local sOk, fail = 0, 0
+        local ok, fail = 0, 0
 
         local scripts = {}
         local function walk(obj)
             local cls = obj.ClassName
             if cls == "LocalScript" or cls == "ModuleScript" or cls == "Script" then
-                if not seenScripts[obj] then
-                    scripts[#scripts + 1] = obj
-                end
+                if not seenScripts[obj] then scripts[#scripts + 1] = obj end
             end
             local kids = safe(function() return obj:GetChildren() end)
             if kids then
@@ -142,7 +142,7 @@ local success, err = pcall(function()
 
         print("  [" .. label .. "] found " .. #scripts .. " scripts")
         for i, s in ipairs(scripts) do
-            if dumpOne(s, dir, label, i, #scripts) then sOk = sOk + 1 else fail = fail + 1 end
+            if dumpOne(s, dir, label, i, #scripts) then ok = ok + 1 else fail = fail + 1 end
         end
 
         local function buildTree(inst, depth)
@@ -172,11 +172,10 @@ local success, err = pcall(function()
         end
         safe(writefile, dir .. "/_remotes.txt", table.concat(remotes, "\n"))
 
-        print("  [" .. label .. "] done: " .. sOk .. " ok, " .. fail .. " failed (" .. string.format("%.1fs", tick() - t0) .. ")")
-        return sOk, fail
+        print("  [" .. label .. "] done: " .. ok .. " ok, " .. fail .. " failed (" .. string.format("%.1fs", tick() - t0) .. ")")
+        return ok, fail
     end
 
-    -- Pass 1: services
     local services = {
         "ReplicatedStorage", "ServerStorage", "Workspace",
         "StarterPlayer", "StarterGui", "StarterPack",
@@ -190,12 +189,11 @@ local success, err = pcall(function()
             local svcDir = outRoot .. "/" .. svcName:gsub("[^%w]", "")
             safe(makefolder, svcDir)
             local s, f = collectInto(svc, svcDir, svcName)
-            totalSuccess, totalFail = totalSuccess + s, totalFail + f
+            totalOk, totalFail = totalOk + s, totalFail + f
             task.wait(0.1)
         end
     end
 
-    -- Pass 2: LocalPlayer runtime containers
     local player = game:GetService("Players").LocalPlayer
     if player then
         print("Dumping LocalPlayer containers...")
@@ -211,14 +209,13 @@ local success, err = pcall(function()
                 local dir = outRoot .. "/LocalPlayer_" .. label
                 safe(makefolder, dir)
                 local s, f = collectInto(cont, dir, label)
-                totalSuccess, totalFail = totalSuccess + s, totalFail + f
+                totalOk, totalFail = totalOk + s, totalFail + f
             end
         end
     end
 
-    -- Pass 3: ALL loaded modules
     if typeof(getloadedmodules) == "function" then
-        print("Dumping all loaded modules (getloadedmodules)...")
+        print("Dumping all loaded modules...")
         local dir = outRoot .. "/LoadedModules"
         safe(makefolder, dir)
         local mods = safe(getloadedmodules) or {}
@@ -228,12 +225,9 @@ local success, err = pcall(function()
             if dumpOne(m, dir, "LoadedModule", i, #mods) then s = s + 1 else f = f + 1 end
         end
         print("  [LoadedModules] done: " .. s .. " ok, " .. f .. " failed")
-        totalSuccess, totalFail = totalSuccess + s, totalFail + f
-    else
-        print("getloadedmodules not available on this executor")
+        totalOk, totalFail = totalOk + s, totalFail + f
     end
 
-    -- Pass 4: nil/orphaned instances
     if typeof(getnilinstances) == "function" then
         print("Dumping nil instances...")
         local dir = outRoot .. "/NilInstances"
@@ -246,22 +240,21 @@ local success, err = pcall(function()
                 if dumpOne(inst, dir, "NilInstance") then s = s + 1 else f = f + 1 end
             end
         end
-        print("  dumped " .. s .. " scripts from " .. #insts .. " nil instances")
-        totalSuccess, totalFail = totalSuccess + s, totalFail + f
+        print("  dumped " .. s .. " from " .. #insts .. " nil instances")
+        totalOk, totalFail = totalOk + s, totalFail + f
     end
 
-    safe(writefile, outRoot .. "/_summary.txt",
-        "-- Luathys v2.4 Dump Complete\n"
-        .. "-- Game: " .. game.Name .. "\n"
-        .. "-- PlaceId: " .. placeId .. "\n"
-        .. "-- Success: " .. totalSuccess .. "\n"
-        .. "-- Failed: " .. totalFail .. "\n"
-        .. "-- Time: " .. os.date("%Y-%m-%d %H:%M:%S") .. "\n")
+    safe(writefile, outRoot .. "/_README.txt",
+        "Bytecode dump complete.\n"
+        .. "Files ending in .luac contain raw Luau bytecode.\n"
+        .. "Run decompile_all.py (with unluau.exe) on this folder to\n"
+        .. "convert every .luac into readable .lua source.\n")
 
     print("")
-    print("=== Dump Complete ===")
-    print("Success: " .. totalSuccess .. " | Failed: " .. totalFail)
-    print("Output: " .. outRoot)
+    print("=== Bytecode Dump Complete ===")
+    print("Success: " .. totalOk .. " | Failed: " .. totalFail)
+    print("Next step: run decompile_all.py on:")
+    print("  " .. outRoot)
 end)
 
 if not success then
