@@ -1,138 +1,256 @@
 --[[
-    Luathys Enhanced Dumper v2.1
-    Compatible with restricted executors and anti-cheat environments
+    Luathys Enhanced Dumper v2.2
+    - No name collisions (unique counters, nothing silently overwritten)
+    - getloadedmodules() coverage: catches every loaded ModuleScript,
+      even ones reparented to nil or required dynamically
+    - Dumps LocalPlayer containers: PlayerGui, Backpack, Character
+    - Nil/orphaned instance dumping restored
+    - Pure ASCII, no Luau-only keywords: compiles on strict executors
 ]]
 
+local function safe(fn, ...)
+    local ok, res = pcall(fn, ...)
+    if ok then return res end
+    return nil
+end
+
 local success, err = pcall(function()
-    if not game or not game.IsLoaded then return end
     if not game:IsLoaded() then game.Loaded:Wait() end
-    wait(1)
+    task.wait(2)
 
     local placeId = game.PlaceId or 0
-    local placeName = game.Name or "Game"
+    local placeName = (game.Name or "Game"):gsub("[^%w_-]", "_")
     local outRoot = "HUKI/" .. placeName .. "_" .. placeId
-    
-    local ok = pcall(function()
-        makefolder("HUKI")
-        makefolder(outRoot)
-    end)
-    if not ok then warn("Could not create output directory") return end
 
-    print("=== Luathys Enhanced Dumper v2.1 ===")
-    print("Game: " .. placeName .. " (PlaceId: " .. placeId .. ")")
+    safe(makefolder, "HUKI")
+    safe(makefolder, outRoot)
 
-    local services = {
-        "ReplicatedStorage", "ServerStorage", "Workspace",
-        "StarterPlayer", "StarterGui", "StarterPack",
-        "ServerScriptService", "Lighting", "SoundService"
-    }
+    print("=== Luathys Enhanced Dumper v2.2 ===")
+    print("Game: " .. game.Name .. " (PlaceId: " .. placeId .. ")")
 
     local totalSuccess, totalFail = 0, 0
-    local summary = "-- Luathys Dump Summary\n-- Game: " .. placeName .. "\n-- PlaceId: " .. placeId .. "\n-- Time: " .. tostring(tick()) .. "\n"
-    writefile(outRoot .. "/_summary.txt", summary)
+    local usedPaths = {}
+    local seenScripts = setmetatable({}, {__mode = "k"})
 
-    for i, svcName in ipairs(services) do
-        local svcOk, svc = pcall(function() return game:GetService(svcName) end)
-        if not svcOk or not svc then
-            print("Service not available: " .. svcName)
-            continue
+    safe(writefile, outRoot .. "/_summary.txt",
+        "-- Luathys v2.2 Dump\n-- Game: " .. game.Name .. "\n-- PlaceId: " .. placeId .. "\n-- Time: " .. os.date("%Y-%m-%d %H:%M:%S") .. "\n")
+
+    local function uniquePath(dir, baseName, cls)
+        baseName = baseName:gsub("[^%w _%-]", "_")
+        if #baseName > 80 then baseName = baseName:sub(1, 80) end
+        local path = dir .. "/" .. baseName .. "_" .. cls .. ".lua"
+        local n = 1
+        while usedPaths[path] do
+            n = n + 1
+            path = dir .. "/" .. baseName .. "_" .. cls .. "_" .. n .. ".lua"
+        end
+        usedPaths[path] = true
+        return path
+    end
+
+    local function decompileScript(script)
+        if typeof(decompile) == "function" then
+            local ok, result = pcall(decompile, script)
+            if ok and type(result) == "string" and #result > 0 then
+                return result
+            end
+        end
+        local ok, src = pcall(function() return script.Source end)
+        if ok and type(src) == "string" and #src > 0 then
+            return src
+        end
+        if typeof(getscriptbytecode) == "function" and crypt and request then
+            local okBc, bc = pcall(getscriptbytecode, script)
+            if okBc and bc then
+                local encoded = bc
+                pcall(function() encoded = crypt.base64.encode(bc) end)
+                local okReq, result = pcall(function()
+                    local req = request({
+                        Url = "https://unluau.lonegladiator.dev/unluau/decompile",
+                        Method = "POST",
+                        Body = encoded,
+                        Headers = {["Content-Type"] = "application/octet-stream"},
+                    })
+                    if req and req.Body and #req.Body > 0 then return req.Body end
+                end)
+                if okReq and result then return result end
+            end
+        end
+        return nil
+    end
+
+    local function dumpOne(script, dir, label)
+        if seenScripts[script] then return false end
+        seenScripts[script] = true
+
+        local fullName = ""
+        pcall(function() fullName = script:GetFullName() end)
+
+        local source = decompileScript(script)
+        if not source then
+            source = "-- Failed to decompile (server-side or protected)\n-- FullName: " .. fullName
         end
 
-        print("Dumping " .. svcName .. "...")
-        local svcDir = outRoot .. "/" .. svcName
-        pcall(function() makefolder(svcDir) end)
+        local header = table.concat({
+            "--[[",
+            "\tLuathys v2.2",
+            "\tContainer: " .. label,
+            "\tScript: " .. script.Name,
+            "\tPath: " .. fullName,
+            "\tClass: " .. script.ClassName,
+            "]]",
+            "",
+        }, "\n")
+
+        local path = uniquePath(dir, script.Name, script.ClassName)
+        if #path > 240 then
+            path = dir .. "/s_" .. tostring(math.floor(tick() * 1000) % 100000000) .. ".lua"
+        end
+
+        if safe(writefile, path, header .. source) then
+            return true
+        end
+        return false
+    end
+
+    local function collectInto(container, dir, label)
+        if not container then return 0, 0 end
+        local sOk, fail = 0, 0
 
         local scripts = {}
-        local function collect(obj)
-            if not obj then return end
+        local function walk(obj)
             local cls = obj.ClassName
             if cls == "LocalScript" or cls == "ModuleScript" or cls == "Script" then
-                table.insert(scripts, obj)
-            end
-            for _, child in ipairs(obj:GetChildren()) do
-                collect(child)
-            end
-        end
-        pcall(collect, svc)
-
-        local successCount, failCount = 0, 0
-        for _, script in ipairs(scripts) do
-            local scriptName = script.Name:gsub("[/\:*?\"<>|]", "_")
-            local cls = script.ClassName
-            local path = svcDir .. "/" .. scriptName .. "_" .. cls .. ".lua"
-
-            local source
-            if decompile then
-                local ok2, result = pcall(decompile, script)
-                if ok2 and result and #result > 0 then source = result end
-            end
-            if not source then
-                local ok2, src = pcall(function() return script.Source end)
-                if ok2 and src and #src > 0 then source = src end
-            end
-            if not source and getscriptbytecode and crypt and crypt.base64 and request then
-                local ok2, bc = pcall(getscriptbytecode, script)
-                if ok2 and bc then
-                    local encoded = crypt.base64.encode(bc)
-                    local ok3, result = pcall(function()
-                        local req = request({Url="https://unluau.lonegladiator.dev/unluau/decompile", Method="POST", Body=encoded, Headers={["Content-Type"]="application/octet-stream"}})
-                        if req and req.Body and #req.Body > 0 then return req.Body end
-                    end)
-                    if ok3 and result then source = result end
+                if not seenScripts[obj] then
+                    scripts[#scripts + 1] = obj
                 end
             end
-
-            if not source then
-                source = "-- Failed to decompile\n-- FullName: " .. script:GetFullName()
+            local kids = safe(function() return obj:GetChildren() end)
+            if kids then
+                for _, child in ipairs(kids) do walk(child) end
             end
+        end
+        pcall(walk, container)
 
-            local header = "--[[\n\tLuathys v2.1\n\tService: " .. svcName .. "\n\tScript: " .. script.Name .. "\n\tPath: " .. script:GetFullName() .. "\n\tClass: " .. cls .. "\n]]\n\n"
-            local writeOk = pcall(function() writefile(path, header .. source) end)
-            if writeOk then successCount = successCount + 1 else failCount = failCount + 1 end
+        print("  [" .. label .. "] found " .. #scripts .. " scripts")
+        for _, s in ipairs(scripts) do
+            if dumpOne(s, dir, label) then sOk = sOk + 1 else fail = fail + 1 end
         end
 
-        totalSuccess = totalSuccess + successCount
-        totalFail = totalFail + failCount
-
-        -- Tree
-        local function build_tree(inst, depth)
+        local function buildTree(inst, depth)
             depth = depth or 0
-            local indent = string.rep("  ", depth)
-            local lines = {indent .. inst.Name .. " [" .. inst.ClassName .. "]"}
-            for _, child in ipairs(inst:GetChildren()) do
-                for _, line in ipairs(build_tree(child, depth + 1)) do
-                    table.insert(lines, line)
+            local lines = {string.rep("  ", depth) .. inst.Name .. " [" .. inst.ClassName .. "]"}
+            local kids = safe(function() return inst:GetChildren() end)
+            if kids then
+                for _, child in ipairs(kids) do
+                    for _, line in ipairs(buildTree(child, depth + 1)) do
+                        lines[#lines + 1] = line
+                    end
                 end
             end
             return lines
         end
-        pcall(function() writefile(svcDir .. "/_tree.txt", table.concat(build_tree(svc), "\n")) end)
+        safe(writefile, dir .. "/_tree.txt", table.concat(buildTree(container), "\n"))
 
-        -- Remotes
-        local remotes = {RemoteEvent={}, RemoteFunction={}, BindableEvent={}, BindableFunction={}}
-        local allOk, all = pcall(function() return svc:GetDescendants() end)
-        if allOk then
+        local remotes = {}
+        local all = safe(function() return container:GetDescendants() end)
+        if all then
             for _, inst in ipairs(all) do
-                if remotes[inst.ClassName] then table.insert(remotes[inst.ClassName], inst.Name) end
+                local cn = inst.ClassName
+                if cn == "RemoteEvent" or cn == "RemoteFunction" or cn == "UnreliableRemoteEvent" then
+                    remotes[#remotes + 1] = cn .. ": " .. inst.Name
+                end
             end
         end
-        local rc = "return {\n"
-        for cls, names in pairs(remotes) do
-            if #names > 0 then
-                rc = rc .. "    " .. cls .. " = {\n"
-                for _, name in ipairs(names) do rc = rc .. "        \"" .. name .. "\",\n" end
-                rc = rc .. "    },\n"
-            end
-        end
-        rc = rc .. "}\n"
-        pcall(function() writefile(svcDir .. "/_remotes.lua", rc) end)
+        safe(writefile, dir .. "/_remotes.txt", table.concat(remotes, "\n"))
 
-        print("  -> " .. successCount .. " ok, " .. failCount .. " failed")
-        wait(0.2)
+        return sOk, fail
     end
 
-    print("\n=== Dump Complete ===")
-    print("Total: " .. (totalSuccess + totalFail) .. " (Success: " .. totalSuccess .. ", Failed: " .. totalFail .. ")")
+    -- Pass 1: services
+    local services = {
+        "ReplicatedStorage", "ServerStorage", "Workspace",
+        "StarterPlayer", "StarterGui", "StarterPack",
+        "ServerScriptService", "Lighting", "SoundService",
+        "ReplicatedFirst", "Teams",
+    }
+    for _, svcName in ipairs(services) do
+        local svc = safe(function() return game:GetService(svcName) end)
+        if svc then
+            print("Dumping " .. svcName .. "...")
+            local svcDir = outRoot .. "/" .. svcName:gsub("[^%w]", "")
+            safe(makefolder, svcDir)
+            local s, f = collectInto(svc, svcDir, svcName)
+            totalSuccess, totalFail = totalSuccess + s, totalFail + f
+            task.wait(0.2)
+        end
+    end
+
+    -- Pass 2: LocalPlayer runtime containers
+    local player = game:GetService("Players").LocalPlayer
+    if player then
+        print("Dumping LocalPlayer containers...")
+        local containers = {
+            {"PlayerGui", player.PlayerGui},
+            {"Backpack", player.Backpack},
+            {"Character", player.Character},
+            {"PlayerScripts", safe(function() return player:FindFirstChildOfClass("PlayerScripts") end)},
+        }
+        for _, pair in ipairs(containers) do
+            local label, cont = pair[1], pair[2]
+            if cont then
+                local dir = outRoot .. "/LocalPlayer_" .. label
+                safe(makefolder, dir)
+                local s, f = collectInto(cont, dir, label)
+                totalSuccess, totalFail = totalSuccess + s, totalFail + f
+            end
+        end
+    end
+
+    -- Pass 3: ALL loaded modules
+    if typeof(getloadedmodules) == "function" then
+        print("Dumping all loaded modules (getloadedmodules)...")
+        local dir = outRoot .. "/LoadedModules"
+        safe(makefolder, dir)
+        local mods = safe(getloadedmodules) or {}
+        print("  found " .. #mods .. " loaded modules")
+        local s, f = 0, 0
+        for _, m in ipairs(mods) do
+            if dumpOne(m, dir, "LoadedModule") then s = s + 1 else f = f + 1 end
+        end
+        totalSuccess, totalFail = totalSuccess + s, totalFail + f
+    else
+        print("getloadedmodules not available on this executor")
+    end
+
+    -- Pass 4: nil/orphaned instances
+    if typeof(getnilinstances) == "function" then
+        print("Dumping nil instances...")
+        local dir = outRoot .. "/NilInstances"
+        safe(makefolder, dir)
+        local insts = safe(getnilinstances) or {}
+        local s, f = 0, 0
+        for _, inst in ipairs(insts) do
+            local cls = inst.ClassName
+            if cls == "LocalScript" or cls == "ModuleScript" or cls == "Script" then
+                if dumpOne(inst, dir, "NilInstance") then s = s + 1 else f = f + 1 end
+            end
+        end
+        print("  dumped " .. s .. " scripts from " .. #insts .. " nil instances")
+        totalSuccess, totalFail = totalSuccess + s, totalFail + f
+    end
+
+    safe(writefile, outRoot .. "/_summary.txt",
+        "-- Luathys v2.2 Dump Complete\n"
+        .. "-- Game: " .. game.Name .. "\n"
+        .. "-- PlaceId: " .. placeId .. "\n"
+        .. "-- Success: " .. totalSuccess .. "\n"
+        .. "-- Failed: " .. totalFail .. "\n"
+        .. "-- Time: " .. os.date("%Y-%m-%d %H:%M:%S") .. "\n")
+
+    print("")
+    print("=== Dump Complete ===")
+    print("Success: " .. totalSuccess .. " | Failed: " .. totalFail)
     print("Output: " .. outRoot)
 end)
 
