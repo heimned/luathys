@@ -1,11 +1,12 @@
 --[[
-    Luathys Enhanced Dumper v2.2
-    - No name collisions (unique counters, nothing silently overwritten)
-    - getloadedmodules() coverage: catches every loaded ModuleScript,
-      even ones reparented to nil or required dynamically
-    - Dumps LocalPlayer containers: PlayerGui, Backpack, Character
-    - Nil/orphaned instance dumping restored
-    - Pure ASCII, no Luau-only keywords: compiles on strict executors
+    Luathys Enhanced Dumper v2.3
+    - Progress output per script (no more silent hangs)
+    - External-API fallback DISABLED by default (it had no timeout and
+      stalled dumps for minutes) - opt in with _G.LUATHYS_USE_API = true
+    - Request timeout of 10s when API fallback is enabled
+    - Per-container elapsed timing
+    - Everything from v2.2: unique paths, getloadedmodules,
+      LocalPlayer containers, nil instances
 ]]
 
 local function safe(fn, ...)
@@ -25,15 +26,17 @@ local success, err = pcall(function()
     safe(makefolder, "HUKI")
     safe(makefolder, outRoot)
 
-    print("=== Luathys Enhanced Dumper v2.2 ===")
+    local USE_API = (_G.LUATHYS_USE_API == true)
+    print("=== Luathys Enhanced Dumper v2.3 ===")
     print("Game: " .. game.Name .. " (PlaceId: " .. placeId .. ")")
+    print("External API fallback: " .. (USE_API and "ON" or "OFF (set _G.LUATHYS_USE_API=true to enable)"))
 
     local totalSuccess, totalFail = 0, 0
     local usedPaths = {}
     local seenScripts = setmetatable({}, {__mode = "k"})
 
     safe(writefile, outRoot .. "/_summary.txt",
-        "-- Luathys v2.2 Dump\n-- Game: " .. game.Name .. "\n-- PlaceId: " .. placeId .. "\n-- Time: " .. os.date("%Y-%m-%d %H:%M:%S") .. "\n")
+        "-- Luathys v2.3 Dump\n-- Game: " .. game.Name .. "\n-- PlaceId: " .. placeId .. "\n-- Time: " .. os.date("%Y-%m-%d %H:%M:%S") .. "\n")
 
     local function uniquePath(dir, baseName, cls)
         baseName = baseName:gsub("[^%w _%-]", "_")
@@ -59,7 +62,7 @@ local success, err = pcall(function()
         if ok and type(src) == "string" and #src > 0 then
             return src
         end
-        if typeof(getscriptbytecode) == "function" and crypt and request then
+        if USE_API and typeof(getscriptbytecode) == "function" and crypt and request then
             local okBc, bc = pcall(getscriptbytecode, script)
             if okBc and bc then
                 local encoded = bc
@@ -70,6 +73,7 @@ local success, err = pcall(function()
                         Method = "POST",
                         Body = encoded,
                         Headers = {["Content-Type"] = "application/octet-stream"},
+                        Timeout = 10,
                     })
                     if req and req.Body and #req.Body > 0 then return req.Body end
                 end)
@@ -79,12 +83,16 @@ local success, err = pcall(function()
         return nil
     end
 
-    local function dumpOne(script, dir, label)
+    local function dumpOne(script, dir, label, idx, total)
         if seenScripts[script] then return false end
         seenScripts[script] = true
 
         local fullName = ""
         pcall(function() fullName = script:GetFullName() end)
+
+        if idx and total and idx % 10 == 0 then
+            print("    [" .. idx .. "/" .. total .. "] " .. fullName)
+        end
 
         local source = decompileScript(script)
         if not source then
@@ -93,7 +101,7 @@ local success, err = pcall(function()
 
         local header = table.concat({
             "--[[",
-            "\tLuathys v2.2",
+            "\tLuathys v2.3",
             "\tContainer: " .. label,
             "\tScript: " .. script.Name,
             "\tPath: " .. fullName,
@@ -115,6 +123,7 @@ local success, err = pcall(function()
 
     local function collectInto(container, dir, label)
         if not container then return 0, 0 end
+        local t0 = tick()
         local sOk, fail = 0, 0
 
         local scripts = {}
@@ -133,8 +142,8 @@ local success, err = pcall(function()
         pcall(walk, container)
 
         print("  [" .. label .. "] found " .. #scripts .. " scripts")
-        for _, s in ipairs(scripts) do
-            if dumpOne(s, dir, label) then sOk = sOk + 1 else fail = fail + 1 end
+        for i, s in ipairs(scripts) do
+            if dumpOne(s, dir, label, i, #scripts) then sOk = sOk + 1 else fail = fail + 1 end
         end
 
         local function buildTree(inst, depth)
@@ -164,6 +173,7 @@ local success, err = pcall(function()
         end
         safe(writefile, dir .. "/_remotes.txt", table.concat(remotes, "\n"))
 
+        print("  [" .. label .. "] done: " .. sOk .. " ok, " .. fail .. " failed (" .. string.format("%.1fs", tick() - t0) .. ")")
         return sOk, fail
     end
 
@@ -182,7 +192,7 @@ local success, err = pcall(function()
             safe(makefolder, svcDir)
             local s, f = collectInto(svc, svcDir, svcName)
             totalSuccess, totalFail = totalSuccess + s, totalFail + f
-            task.wait(0.2)
+            task.wait(0.1)
         end
     end
 
@@ -215,9 +225,10 @@ local success, err = pcall(function()
         local mods = safe(getloadedmodules) or {}
         print("  found " .. #mods .. " loaded modules")
         local s, f = 0, 0
-        for _, m in ipairs(mods) do
-            if dumpOne(m, dir, "LoadedModule") then s = s + 1 else f = f + 1 end
+        for i, m in ipairs(mods) do
+            if dumpOne(m, dir, "LoadedModule", i, #mods) then s = s + 1 else f = f + 1 end
         end
+        print("  [LoadedModules] done: " .. s .. " ok, " .. f .. " failed")
         totalSuccess, totalFail = totalSuccess + s, totalFail + f
     else
         print("getloadedmodules not available on this executor")
@@ -241,7 +252,7 @@ local success, err = pcall(function()
     end
 
     safe(writefile, outRoot .. "/_summary.txt",
-        "-- Luathys v2.2 Dump Complete\n"
+        "-- Luathys v2.3 Dump Complete\n"
         .. "-- Game: " .. game.Name .. "\n"
         .. "-- PlaceId: " .. placeId .. "\n"
         .. "-- Success: " .. totalSuccess .. "\n"
