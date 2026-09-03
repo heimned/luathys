@@ -22,16 +22,6 @@ if not defined PY (
     exit /b 1
 )
 
-rem Check unluau.exe exists here
-if not exist unluau.exe (
-    echo [ERROR] unluau.exe not found in this folder:
-    echo         %cd%
-    echo Download it and place it next to this .bat file.
-    echo.
-    pause
-    exit /b 1
-)
-
 rem Check the script exists here
 if not exist decompile_all.py (
     echo [ERROR] decompile_all.py not found in this folder.
@@ -45,7 +35,7 @@ set "TARGET=%~1"
 if not defined TARGET (
     echo Drag your dump folder onto this .bat file,
     echo or paste the full folder path below.
-    echo Example: C:\Users\you\AppData\Local\Madium\Workspace\Ugc_130960021905304
+    echo Example: C:\Users\you\Documents\{GameName}_{PlaceId}
     echo.
     set /p TARGET=Folder path:
 )

@@ -1,6 +1,13 @@
 # Lua
 *.luac
 
+# Python
+__pycache__/
+*.pyc
+build/
+dist/
+*.spec
+
 # IDE
 .idea/
 .vscode/

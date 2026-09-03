@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Lua
+        run: sudo apt-get update && sudo apt-get install -y lua5.4
+
+      - name: Python syntax check
+        run: |
+          find . -name '*.py' \
+            -not -path './.git/*' \
+            -not -path './legacy/*' \
+            -print0 | xargs -0 -n1 python -m py_compile
+
+      - name: Lua syntax check
+        run: |
+          find . -name '*.lua' \
+            -not -path './.git/*' \
+            -not -path './legacy/*' \
+            -print0 | xargs -0 -n1 luac5.4 -p
