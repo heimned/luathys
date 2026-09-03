@@ -43,7 +43,7 @@ except ImportError:
     import pymem.process
     import pymem.exception
 
-VERSION = "1.0.0"
+VERSION = "1.1.1"
 DEFAULT_OUTPUT_DIR = os.path.expanduser("~/HUKI")
 
 SIGNATURES = {

@@ -6,9 +6,9 @@
     to work since getscriptbytecode functions on your executor -
     plus whatever source/decompile is obtainable locally.
 
-    After dumping, run decompile_all.py (in the same folder as
-    unluau.exe) against the output directory to turn every .luac
-    into readable .lua offline.
+    After dumping, run decompile_all.py against the output
+    directory to turn every .luac into readable .lua offline
+    (Luacid API - no local decompiler binary required).
 
     Optional:
       _G.LUATHYS_API_URL = "https://your-own-decompiler/endpoint"
@@ -121,7 +121,7 @@ local success, err = pcall(function()
         local reason = (script.ClassName == "Script")
             and "server Script - bytecode is stripped before replication"
             or "no bytecode and no source available"
-        safe(writefile, pf, "-- " .. reason .. \n-- FullName: " .. fullName .. "\n-- Class: " .. script.ClassName)
+        safe(writefile, pf, "-- " .. reason .. "\n-- FullName: " .. fullName .. "\n-- Class: " .. script.ClassName)
         return "fail"
     end
 
@@ -253,7 +253,7 @@ local success, err = pcall(function()
     safe(writefile, outRoot .. "/_README.txt",
         "Bytecode dump complete.\n"
         .. "Files ending in .luac contain raw Luau bytecode.\n"
-        .. "Run decompile_all.py (with unluau.exe) on this folder to\n"
+        .. "Run decompile_all.py on this folder to\n"
         .. "convert every .luac into readable .lua source.\n")
 
     print("")

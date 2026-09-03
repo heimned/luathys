@@ -1,5 +1,12 @@
 # Dumper Comparison: aboris vs Enhanced Universal Dumper
 
+> **Historical note.** This document describes the now-superseded
+> "Enhanced Universal Dumper v2.1" (`dumper_engine.lua`), which has been
+> moved to [`legacy/`](../legacy/README.md). The current pipeline is
+> [`luathys.lua`](../luathys.lua) (raw bytecode dump) +
+> [`decompile_all.py`](../decompile_all.py) (offline Luacid decompilation).
+> Keep this page only as background on the design evolution.
+
 ## Original aboris (xfwil/aboris)
 
 | Feature | Status |
