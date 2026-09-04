@@ -1,22 +1,30 @@
 --[[
-    Ospei Hood Rivals  v1.5-dev (Syde UI)
-    Dev version: same logic core as hoodrivals.lua, UI replaced with
-    the Syde library (essencejs/syde) via a patched loader that fixes
-    the repo's asset/source mismatch (modal.Buttons, slider.Title).
+    Ospei Hood Rivals  v1.6  (Syde UI)
+    Multi-place game: players teleport between places, so this script is
+    not locked to any single PlaceId — it runs wherever the loader maps
+    a Hood Rivals place. (PlaceIds 77463332823746, 113272123504853)
 
-    PlaceIds 77463332823746, 113272123504853 (multi-place: runs wherever
-    the loader maps a Hood Rivals place).
+    Solara floor: no hooks, no getgc, no Drawing. Decompile-verified
+    (Luacid v9, 2026-08-30): weapon pipeline patches Weapon_Module /
+    SimpleCast / WeaponData module tables via require() cache.
 
-    This file is a DEVELOPMENT version - it does not touch the shipped
-    hoodrivals.lua. Load it from your executor like any single script.
-
-    USAGE:
-      LocalPlayer / executor -> paste & run, or:
-      loadstring(game:HttpGet("https://raw.githubuser" ..
-        "content.com/<your-host>/hoodrivals_syde_dev.lua", true))()
+    v1.6: UI moved to the Syde library (essencejs/syde) via a patched
+    loader that repairs the repo's asset/source mismatch (Toggle
+    interact/configure, modal.Buttons, slider.Title, Paragraph), guards
+    the configure-popup and modal-teardown lifecycles, strips the Privacy
+    tab, and adds the Opsei Segmented / RangeSlider / Stepper / MultiSelect
+    controls. DEBUG at the top restores the loader trace.
 ]]
 
 if not game:IsLoaded() then game.Loaded:Wait() end
+
+-- Console hygiene: the loader/patch trace is noise once the suite is
+-- verified working. Flip DEBUG to true to see the full [SydeLoader]/[Ospei]
+-- progress output again.
+local DEBUG = false
+local function log(...)
+    if DEBUG then warn(...) end
+end
 
 -- RE-RUN GUARD: if a previous instance of this script is still alive
 -- (e.g. the window was closed via Syde's X button before the patch that
@@ -29,17 +37,17 @@ do
     if type(prevUnload) == "function" then
         local ok, err = pcall(prevUnload)
         if not ok then
-            warn("[Ospei] previous instance unload error: " .. tostring(err))
+            log("[Ospei] previous instance unload error: " .. tostring(err))
         end
         task.wait(0.6) -- let its connections/patches fully release
     end
 end
 
--- cloneref: executor instance-reference tracking can cause require() to
--- return a DIFFERENT table than the one the game's own scripts see. Cloning
--- the reference before require() forces the cache to hit the real module
--- table so our patches (Weapon_Module.UpdateAmmo counter, etc.) actually
--- reach the game's code. Applied to all services for consistency.
+-- cloneref: executor instance-reference tracking can cause Instance calls to
+-- hit a separate wrapper. Use it for services, but do NOT use the executor's
+-- require() for game modules: that runs the module in the executor VM. Some
+-- Hood Rivals dependencies require RobloxScript-only modules and will throw
+-- "Cannot require a RobloxScript module from a non RobloxScript context" there.
 local cloneRef
 if typeof(cloneref) == "function" then
     cloneRef = function(x)
@@ -48,6 +56,26 @@ if typeof(cloneref) == "function" then
     end
 else
     cloneRef = function(x) return x end
+end
+
+-- @@CONTEXT FIX: prefer Roblox's own environment require when an executor
+-- exposes it. That preserves the game's VM/context and its existing
+-- ModuleScript cache. Fall back to normal require in Studio/ordinary Lua.
+local gameRequire = require
+if type(getrenv) == "function" then
+    local okEnv, env = pcall(getrenv)
+    if okEnv and type(env) == "table" and type(env.require) == "function" then
+        gameRequire = env.require
+    end
+end
+local function requireGameModule(module)
+    if not module then return false, "module not found" end
+    -- Deliberately NOT falling back to plain require: on executors where
+    -- getrenv().require fails (Solara), plain require re-executes the module
+    -- in an isolated VM - the game never sees our patches AND the second
+    -- copy's connections error against uninitialized state ("CameraOffsetV"
+    -- spam). A silent no-op is better than that.
+    return pcall(gameRequire, module)
 end
 
 local Players          = cloneRef(game:GetService("Players"))
@@ -94,6 +122,17 @@ local P = {
     Success = Color3.fromRGB(106, 220, 130), -- no house token; v1.0 value
     Danger  = pick(SP.TierBlatant,  Color3.fromRGB(255, 82, 82)),
     Warn    = pick(SP.TierBalanced, Color3.fromRGB(255, 183, 77)),
+}
+
+-- @@MOTION EDIT: unified motion scale. One easing language (Quad Out; Back
+-- reserved for pops), three duration tiers (Fast 0.12 / Med 0.18 / Slow 0.25).
+-- Every custom control pulls from here so nothing animates on its own ad-hoc
+-- recipe anymore.
+local MOTION = {
+    Fast = TweenInfo.new(0.12, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+    Med  = TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+    Slow = TweenInfo.new(0.25, Enum.EasingStyle.Exponential, Enum.EasingDirection.Out),
+    Pop  = TweenInfo.new(0.16, Enum.EasingStyle.Back, Enum.EasingDirection.Out),
 }
 
 local LOGO_ID = (SP and SP.AssetLogo) or "rbxassetid://71068731540117"
@@ -542,14 +581,52 @@ local function silentStep(dt)
     end
 end
 
+-- Resolve the click primitive once: executors differ (mouse1click is the
+-- common one; Solara may only expose press/release or VirtualUser). If none
+-- exist the trigger bot can't actuate - report that instead of silently
+-- doing nothing.
+local clickFn
+local function resolveClick()
+    if clickFn ~= nil then return clickFn end
+    if typeof(mouse1click) == "function" then
+        clickFn = function() mouse1click() end
+        log("[Ospei] click primitive: mouse1click")
+    elseif typeof(mouse1press) == "function" and typeof(mouse1release) == "function" then
+        clickFn = function() mouse1press(); task.delay(0.04, mouse1release) end
+        log("[Ospei] click primitive: mouse1press/release")
+    else
+        local ok, vu = pcall(function()
+            return game:GetService("VirtualUser")
+        end)
+        if ok and vu and typeof(vu.CaptureController) == "function" then
+            clickFn = function()
+                pcall(function()
+                    local cam = getCamera()
+                    local vp = cam.ViewportSize
+                    vu:ClickButton1(Vector2.new(vp.X / 2, vp.Y / 2))
+                end)
+            end
+            log("[Ospei] click primitive: VirtualUser")
+        else
+            clickFn = false
+        end
+    end
+    if not clickFn then
+        log("[Ospei] no click primitive available - trigger bot disabled")
+    end
+    return clickFn
+end
+
 local function triggerStep()
-    if not mouse1click then return end
+    local click = resolveClick()
+    if not click then return end
     local now = os.clock()
     if now - lastTrigger < TRIGGER_COOLDOWN then return end
     local char, part = pickTarget()
     if char and part then
         lastTrigger = now
-        pcall(mouse1click)
+        pcall(click)
+        if DEBUG then log("[Ospei] trigger fired on " .. char.Name) end
     end
 end
 
@@ -680,9 +757,13 @@ end
 ----------------------------------------------------------------
 local WMI = (function()
     local api = {}
-    local okWM, WM = pcall(require, cloneRef(game.ReplicatedStorage.Weapon_Module))
-    local okSC, SC = pcall(require, cloneRef(game.ReplicatedStorage.SimpleCast))
-    local okWD, WD = pcall(require, cloneRef(game.ReplicatedStorage.WeaponData))
+    local replicatedStorage = game:GetService("ReplicatedStorage")
+    local okWM, WM = requireGameModule(replicatedStorage:FindFirstChild("Weapon_Module"))
+    local okSC, SC = requireGameModule(replicatedStorage:FindFirstChild("SimpleCast"))
+    local okWD, WD = requireGameModule(replicatedStorage:FindFirstChild("WeaponData"))
+    if not okWM or not okSC or not okWD then
+        log("[Ospei] weapon module patches unavailable; game VM require failed")
+    end
     local origRecoil = okWM and WM.recoil
     local origFire = okSC and SC.Fire
     local origShake = okWM and WM.ScreenShake
@@ -901,6 +982,10 @@ local WMI = (function()
         countedTool = nil
         cycleTimeout = 0
     end
+    -- Gun-feel features are no-ops when the game modules couldn't be
+    -- required (executor lacks a game-VM require). Surface that once so a
+    -- dead "No Recoil" toggle isn't mistaken for a bug.
+    api.available = (okWM and okSC and okWD) == true
     return api
 end)()
 WMI.apply()
@@ -1305,7 +1390,11 @@ local function updateEspBoxes(dt)
         end
 
         if live then
-            alpha = fade * (box.occluded and 0.4 or 1)
+            -- @@MOTION EDIT: lerp alpha so occlusion (1 <-> 0.4) is a smooth
+            -- fade instead of a hard step every 150ms raycast tick.
+            local targetAlpha = fade * (box.occluded and 0.4 or 1)
+            box.alpha = box.alpha + (targetAlpha - box.alpha) * math.clamp(dt * 8, 0, 1)
+            alpha = box.alpha
             if alpha <= 0.03 then
                 box.root.Visible = false
                 live = false
@@ -1515,12 +1604,12 @@ local Hitmarker = (function()
             lines[i] = l
         end
         for _, l in ipairs(lines) do
-            TweenService:Create(l, TweenInfo.new(0.12, Enum.EasingStyle.Back, Enum.EasingDirection.Out),
-                { Size = UDim2.fromOffset(15, 2) }):Play()
+            -- @@MOTION EDIT: pop with the shared Back-out scale
+            TweenService:Create(l, MOTION.Pop, { Size = UDim2.fromOffset(15, 2) }):Play()
         end
         task.delay(0.2, function()
             for _, l in ipairs(lines) do
-                TweenService:Create(l, TweenInfo.new(0.12), { BackgroundTransparency = 1 }):Play()
+                TweenService:Create(l, MOTION.Fast, { BackgroundTransparency = 1 }):Play()
             end
             task.delay(0.14, function() pcall(function() gui:Destroy() end) end)
         end)
@@ -1550,7 +1639,7 @@ local FovRing = (function()
         Instance.new("UICorner", ring).CornerRadius = UDim.new(1, 0)
         local stroke = Instance.new("UIStroke", ring)
         stroke.Color = P.Accent; stroke.Thickness = 1; stroke.Transparency = 0.55
-        local function update()
+        local function update(dt)
             local show = CFG.aimStyle ~= "Off" and CFG.fovEnabled
             ring.Visible = show
             if show then
@@ -1560,7 +1649,10 @@ local FovRing = (function()
                 local radius = math.tan(math.rad(CFG.fovRadius))
                     / math.tan(math.rad(cam.FieldOfView / 2)) * (vp.Y / 2)
                 radius = math.clamp(radius, 10, vp.Y)
-                ring.Size = UDim2.fromOffset(radius * 2, radius * 2)
+                -- @@MOTION EDIT: lerp size toward the camera-derived target
+                -- instead of snapping every frame (FOV changes glide in).
+                local target = UDim2.fromOffset(radius * 2, radius * 2)
+                ring.Size = ring.Size:Lerp(target, math.clamp((dt or (1 / 60)) * 12, 0, 1))
             end
         end
         return { update = update, destroy = function() pcall(function() gui:Destroy() end) end }
@@ -1644,9 +1736,30 @@ local SydeUI = (function()
     end)
 
     local tFetch = tick()
-    local src = game:HttpGet("https://raw.githubuser" .. "content.com/essencejs/syde/refs/heads/main/source", true)
+    -- Pin Syde to the exact source revision verified against the current
+    -- asset/source compatibility fixes. Do not follow mutable `main` in a
+    -- production loader: a remote edit can invalidate every source patch.
+    local SYDE_SOURCE_COMMIT = "98a93da35ebbd47c44e1c900948f6bdc51a3c7c3"
+    local SYDE_SOURCE_URL = "https://raw.githubusercontent.com/essencejs/syde/"
+        .. SYDE_SOURCE_COMMIT .. "/source"
+    local src = game:HttpGet(SYDE_SOURCE_URL, true)
+
+    if type(src) ~= "string" or #src < 1000 then
+        error("[SydeLoader] pinned Syde source was empty or incomplete")
+    end
 
     local ANCHOR = 'game:GetObjects("rbxassetid://123800669522471")'
+    for _, marker in ipairs({
+        ANCHOR,
+        "function telement:Slider(Slider)",
+        "Slider.Title.Text = Options.Title",
+        "return syde",
+    }) do
+        if not src:find(marker, 1, true) then
+            error("[SydeLoader] pinned Syde source is incompatible; missing " .. marker)
+        end
+    end
+
     local PATCH = [[
 pcall(function()
 	local m = Library:FindFirstChild("main")
@@ -1769,6 +1882,25 @@ end)
     local pos = src:find(ANCHOR, 1, true)
     local patchedSrc = src
 
+    -- PATCH the loaded asset after `Library` has been assigned. The previous
+    -- version only computed `pos` and never spliced PATCH into the fetched
+    -- source, so the broad template repair was dead code. Insert after the
+    -- `[1]` that belongs to the Library GetObjects call, not before the
+    -- `local Library = ...` declaration.
+    if pos then
+        local assetEnd = src:find("]", pos + #ANCHOR, true)
+        if assetEnd then
+            patchedSrc = src:sub(1, assetEnd)
+                .. "\n" .. PATCH .. "\n"
+                .. src:sub(assetEnd + 1)
+            log("[SydeLoader] library asset repair injected")
+        else
+            log("[SydeLoader] Library asset end not found - asset repair skipped")
+        end
+    else
+        log("[SydeLoader] Library asset anchor not found - asset repair skipped")
+    end
+
     -- PATCH the source at the CLONE SITES: the asset's templates are missing
     -- children the builders expect (modal.Buttons, slider.Title, paragraph
     -- Frame>title/Content). Instead of guessing asset paths, wrap each clone
@@ -1810,7 +1942,7 @@ end)
     -- plain-text replace-all: `gsub` treats the needle as a Lua pattern and
     -- `(`, `)`, `.` are magic chars, so we find+concat instead.
     local function patchClone(needle, replacement)
-        local out, from, changed = {}, 1, false
+        local out, from, changed, count = {}, 1, false, 0
         while true do
             local s = patchedSrc:find(needle, from, true)
             if not s then break end
@@ -1818,12 +1950,14 @@ end)
             out[#out + 1] = replacement
             from = s + #needle
             changed = true
+            count = count + 1
         end
         if not changed then
-            warn("[SydeLoader] clone patch MISSED: " .. needle)
+            log("[SydeLoader] clone patch MISSED: " .. needle)
         else
             out[#out + 1] = patchedSrc:sub(from)
             patchedSrc = table.concat(out)
+            log("[SydeLoader] clone patch applied x" .. tostring(count) .. ": " .. needle)
         end
         return changed
     end
@@ -1833,6 +1967,20 @@ end)
     -- sliders (old settings block, then new block)
     patchClone("window.settings.pages.page.Slider.slideholder.slider:Clone()", ensureSliderOld)
     patchClone("pages.page.Slider.slideholder.slider:Clone()", ensureSlider)
+
+    -- Last-resort guard for Syde revisions that change the clone path but
+    -- retain the nested builder. The runtime error is raised on this exact
+    -- member access, after the clone has already been named "DS Density" or
+    -- "Drag Smoothness". Repair the clone itself immediately before the
+    -- access so the fix does not depend on the asset hierarchy or path.
+    local sliderTitlePatched = patchClone(
+        "Slider.Title.Text = Options.Title",
+        "if not Slider:FindFirstChild('Title') then local __l = Instance.new('TextLabel'); __l.Name = 'Title'; __l.Size = UDim2.new(1, 0, 0, 20); __l.BackgroundTransparency = 1; __l.Parent = Slider end; Slider.Title.Text = Options.Title"
+    )
+    if not sliderTitlePatched then
+        error("[SydeLoader] failed to guard Syde's nested slider Title access")
+    end
+
     -- paragraphs (old settings block, then new block)
     patchClone("window.settings.pages.page.Paragraph:Clone()", ensureParaOld)
     patchClone("pages.page.Paragraph:Clone()", ensurePara)
@@ -1841,6 +1989,50 @@ end)
     -- section (bold + icon, new block)
     patchClone("pages.page.Section:Clone()", ensureSection)
 
+    -- Toggle template: the builders index toggle.interact (the click target)
+    -- and toggle.configure (the gear popup anchor) directly. A stripped asset
+    -- missing either aborts the builder before the click handler is wired,
+    -- leaving a dead toggle that never enables. Ensure both children exist
+    -- right before cloning (old settings block first: its needle contains
+    -- the new one).
+    local ensureToggleChildren = "if not __t:FindFirstChild('interact') then local __b = Instance.new('TextButton'); __b.Name = 'interact'; __b.Size = UDim2.new(1, 0, 1, 0); __b.BackgroundTransparency = 1; __b.Text = ''; __b.AutoButtonColor = false; __b.ZIndex = 5; __b.Parent = __t end; if not __t:FindFirstChild('configure') then local __c = Instance.new('ImageButton'); __c.Name = 'configure'; __c.Size = UDim2.new(0, 18, 0, 18); __c.Position = UDim2.new(1, -150, 0.5, -9); __c.BackgroundTransparency = 1; __c.Image = 'rbxassetid://77497922982585'; __c.ImageColor3 = Color3.fromRGB(104, 104, 104); __c.ZIndex = 5; __c.Parent = __t end"
+    local ensureToggle = makeEnsureClone("pages.page.Toggle", ensureToggleChildren)
+    local ensureToggleOld = makeEnsureClone("window.settings.pages.page.Toggle", ensureToggleChildren)
+    patchClone("window.settings.pages.page.Toggle:Clone()", ensureToggleOld)
+    patchClone("pages.page.Toggle:Clone()", ensureToggle)
+
+    -- The configure popup tracks its toggle every RenderStepped while open.
+    -- If the GUI is destroyed while a popup is open (X-close / unload), the
+    -- connection survives and indexes toggle.configure on a dead Frame —
+    -- "configure is not a valid member of Frame" every frame, forever.
+    -- Bail out and disconnect once the anchor child is gone.
+    local POPUP_NEEDLE = "toggleConfiguration:TweenPosition(UDim2.new(0,toggle.configure.AbsolutePosition.X - 190,0,toggle.configure.AbsolutePosition.Y + toggle.configure.AbsoluteSize.Y + 65), Enum.EasingDirection.Out, Enum.EasingStyle.Quad, 0.1, true)"
+    patchClone(POPUP_NEEDLE, "if not toggle:FindFirstChild('configure') then if TogService then TogService:Disconnect() end return end " .. POPUP_NEEDLE)
+
+    -- Modal dim cleanup runs ~1.15s after Confirm (closeModal's internal
+    -- waits) and indexes ui.main on a ScreenGui our deferred unload may
+    -- already have destroyed -> "main is not a valid member of ScreenGui".
+    -- FindFirstChild is destroy-safe; skip the fade when the GUI is gone.
+    patchClone("ui.main.dim.Visible = false", "local __dim = ui:FindFirstChild('main') and ui.main:FindFirstChild('dim'); if __dim then __dim.Visible = false end")
+
+    -- The Library asset's "main" frame can be missing the "settings" panel
+    -- (the asset is mutable and has drifted from the source before). syde's
+    -- SettingInit + gear/close connects index window.settings at load time,
+    -- which would kill the whole module. Make inittab a no-op builder when
+    -- the panel is absent and early-return the gear open/close tweens. We
+    -- never use syde's settings UI (own CFG + keybinds), so an inert
+    -- settings tab is fine.
+    patchClone("local tabsContainer = window.settings.tabs.ScrollingFrame",
+        "if not window:FindFirstChild('settings') then return setmetatable({}, { __index = function() return function() end end }) end local tabsContainer = window.settings.tabs.ScrollingFrame")
+    patchClone("function opensettings()",
+        "function opensettings()\n\t\tif not window:FindFirstChild('settings') then return end")
+    patchClone("function closesettings()",
+        "function closesettings()\n\t\tif not window:FindFirstChild('settings') then return end")
+    patchClone("\twindow.top.functions.settings.interact.MouseButton1Click:Connect(function()\n\t\tif not settingsOpen then\n\t\t\tsettingsOpen = true\n\t\t\topensettings()\n\t\tend\n\tend)",
+        "\tif window.top.functions:FindFirstChild('settings') then window.top.functions.settings.interact.MouseButton1Click:Connect(function()\n\t\tif not settingsOpen then\n\t\t\tsettingsOpen = true\n\t\t\topensettings()\n\t\tend\n\tend) end")
+    patchClone("\twindow.settings.top.functions.close.interact.MouseButton1Click:Connect(function()\n\t\tif settingsOpen then\n\t\t\tsettingsOpen = false\n\t\t\tclosesettings()\n\t\tend\n\tend)",
+        "\tif window:FindFirstChild('settings') then window.settings.top.functions.close.interact.MouseButton1Click:Connect(function()\n\t\tif settingsOpen then\n\t\t\tsettingsOpen = false\n\t\t\tclosesettings()\n\t\tend\n\tend) end")
+
     -- Patch the window's X (close) button: Syde's default only destroys
     -- the GUI, leaving the Opsei script's connections/patches running.
     -- Route it through the full unload so re-running is always clean.
@@ -1848,15 +2040,17 @@ end)
     -- Confirm callback, and Syde's closeModal() continues right after;
     -- destroying the GUI synchronously here makes closeModal() touch a
     -- destroyed instance ("Buttons is not a valid member of Frame").
+    -- 1.5s (on top of the callback's own task.wait(1)) also clears the
+    -- modal's full fade-out sequence (~2.15s after the click).
     local CLOSE_ANCHOR = "Library:Destroy()"
     local ca = patchedSrc:find(CLOSE_ANCHOR, 1, true)
     if ca then
         patchedSrc = patchedSrc:sub(1, ca - 1)
-            .. "task.delay(1, function() if _G.Ospei_HoodRivals_Unload then _G.Ospei_HoodRivals_Unload() else Library:Destroy() end end)"
+            .. "task.delay(1.5, function() if _G.Ospei_HoodRivals_Unload then _G.Ospei_HoodRivals_Unload() else Library:Destroy() end end)"
             .. patchedSrc:sub(ca + #CLOSE_ANCHOR)
-        warn("[SydeLoader] X-close now triggers full Opsei unload (deferred)")
+        log("[SydeLoader] X-close now triggers full Opsei unload (deferred)")
     else
-        warn("[SydeLoader] could not find Library:Destroy() - close patch skipped")
+        log("[SydeLoader] could not find Library:Destroy() - close patch skipped")
     end
 
     -----------------------------------------------------------------
@@ -1866,6 +2060,16 @@ end)
     -- and before the guard loop so they're pcall-wrapped like the rest.
     -----------------------------------------------------------------
     local CUSTOM_ELEMENTS = [[
+		--@@Opsei Motion: unified tween scale (Quad Out; Back only for pops).
+		-- Every custom control below pulls from MOTION so nothing animates on
+		-- its own ad-hoc recipe anymore.
+		local MOTION = {
+			Fast = TweenInfo.new(0.12, Enum.EasingStyle.Quad, Enum.EasingDirection.Out);
+			Med  = TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out);
+			Slow = TweenInfo.new(0.25, Enum.EasingStyle.Exponential, Enum.EasingDirection.Out);
+			Pop  = TweenInfo.new(0.16, Enum.EasingStyle.Back, Enum.EasingDirection.Out);
+		}
+
 		--@@Opsei Segmented  (Syde-native: dropdown-style row, bar #151515 corner 10, accent pill)
 		function initelement:Segmented(Opt)
 			local data = {
@@ -1943,8 +2147,7 @@ end)
 				for i, o in ipairs(data.Options) do
 					if o == data.Value then idx = i; break end
 				end
-				local t = instant and TweenInfo.new(0)
-					or TweenInfo.new(0.22, Enum.EasingStyle.Exponential, Enum.EasingDirection.Out)
+				local t = instant and TweenInfo.new(0) or MOTION.Med
 				tweenservice:Create(pill, t, {
 					Position = UDim2.new((idx - 1) / n, 0, 0, 0),
 					Size = UDim2.new(1 / n, 0, 1, 0),
@@ -2117,7 +2320,7 @@ end)
 				local span = math.max(high - low, 1e-6)
 				local f = function(v) return (v - low) / span end
 				local pMin, pMax = f(data.MinValue), f(data.MaxValue)
-				local t = instant and TweenInfo.new(0) or TweenInfo.new(0.12, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+				local t = instant and TweenInfo.new(0) or MOTION.Fast
 				tweenservice:Create(tMin, t, { Position = UDim2.new(pMin, 0, 0.5, 0) }):Play()
 				tweenservice:Create(tMax, t, { Position = UDim2.new(pMax, 0, 0.5, 0) }):Play()
 				tweenservice:Create(band, t, {
@@ -2312,22 +2515,9 @@ end)
 			edit.ZIndex = 3
 			edit.Parent = pill
 
-			local editing = false
-			edit.Focused:Connect(function()
-				editing = true
-			end)
-			edit.FocusLost:Connect(function()
-				editing = false
-				local n = tonumber((edit.Text:gsub("[^%d%.%-]", "")))
-				edit.Text = ""
-				if n then
-					data.Value = snap(n)
-					refresh()
-					commit()
-				else
-					refresh()
-				end
-			end)
+			-- Focused/FocusLost are wired further down, AFTER refresh/commit
+			-- exist as locals (a `local function` is invisible to closures
+			-- compiled before its declaration — the handlers would call nil).
 
 			-- +/- icon buttons
 			local function iconBtn(asset, x)
@@ -2349,10 +2539,10 @@ end)
 				ic.ScaleType = Enum.ScaleType.Fit
 				ic.Parent = b
 				b.MouseEnter:Connect(function()
-					tweenservice:Create(ic, TweenInfo.new(0.15), { ImageColor3 = syde.theme.HitBox }):Play()
+					tweenservice:Create(ic, MOTION.Fast, { ImageColor3 = syde.theme.HitBox }):Play()
 				end)
 				b.MouseLeave:Connect(function()
-					tweenservice:Create(ic, TweenInfo.new(0.2), { ImageColor3 = Color3.fromRGB(213, 213, 213) }):Play()
+					tweenservice:Create(ic, MOTION.Med, { ImageColor3 = Color3.fromRGB(213, 213, 213) }):Play()
 				end)
 				return b, ic
 			end
@@ -2369,8 +2559,15 @@ end)
 			local function refresh(instant)
 				lbl.Text = string.format("%." .. dp .. "f", data.Value) .. data.Suffix
 				updatePillWidth()
-				local t = instant and TweenInfo.new(0) or TweenInfo.new(0.12, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
-				tweenservice:Create(lbl, t, { Position = UDim2.new(0, 22, 0, 0) }):Play()
+				-- @@MOTION EDIT: the old code tweened Position to the value it
+				-- already had (a no-op), so the number just snapped. Pulse the
+				-- value label instead so changes read as animated.
+				if instant then
+					lbl.TextTransparency = 0
+				else
+					lbl.TextTransparency = 1
+					tweenservice:Create(lbl, MOTION.Fast, { TextTransparency = 0 }):Play()
+				end
 			end
 
 			local function commit()
@@ -2384,6 +2581,26 @@ end)
 					syde.Flags[data.Flag] = data
 				end
 			end
+
+			-- click-to-type: show the raw number while editing, commit on
+			-- Enter/blur. Wired here so refresh/commit are real upvalues.
+			edit.Focused:Connect(function()
+				edit.Text = string.format("%." .. dp .. "f", data.Value)
+				edit.TextTransparency = 0
+				lbl.TextTransparency = 1
+			end)
+			edit.FocusLost:Connect(function()
+				edit.TextTransparency = 1
+				local n = tonumber((edit.Text:gsub("[^%d%.%-]", "")))
+				edit.Text = ""
+				if n then
+					data.Value = snap(n)
+					refresh(true)
+					commit()
+				else
+					refresh(true)
+				end
+			end)
 
 			btnDec.MouseButton1Click:Connect(function()
 				data.Value = snap(data.Value - data.Increment)
@@ -2581,6 +2798,21 @@ end)
 			local listPad = Instance.new("UIPadding", list)
 			listPad.PaddingBottom = UDim.new(0, 4)
 
+			-- @@MOTION EDIT: group search + list so they fade with the shell
+			-- instead of popping in via .Visible. Visibility is now driven
+			-- solely by this CanvasGroup.
+			local content = Instance.new("CanvasGroup")
+			content.Size = UDim2.new(1, 0, 1, 0)
+			content.BackgroundTransparency = 1
+			content.GroupTransparency = 1
+			content.Visible = false
+			content.ZIndex = 2
+			content.Parent = ms
+			searchFrame.Parent = content
+			searchFrame.Visible = true
+			list.Parent = content
+			list.Visible = true
+
 			local rows = {} -- {row, nameLbl, check, option}
 
 			local function refreshRow(r)
@@ -2703,14 +2935,24 @@ end)
 			local expanded = false
 			local function setExpanded(on)
 				expanded = on
-				tweenservice:Create(ms, TweenInfo.new(0.25, Enum.EasingStyle.Exponential, Enum.EasingDirection.Out), {
+				tweenservice:Create(ms, MOTION.Slow, {
 					Size = UDim2.new(1, -35, 0, on and EXPANDED_H or COLLAPSED_H),
 				}):Play()
-				tweenservice:Create(barArrow, TweenInfo.new(0.25, Enum.EasingStyle.Exponential), {
+				tweenservice:Create(barArrow, MOTION.Slow, {
 					Rotation = on and 180 or 0,
 				}):Play()
-				searchFrame.Visible = on
-				list.Visible = on
+				-- @@MOTION EDIT: fade contents in/out as a group with the shell.
+				-- Hide via .Visible only after the collapse fade completes so
+				-- the invisible list can't eat clicks while collapsed.
+				if on then
+					content.Visible = true
+					tweenservice:Create(content, MOTION.Slow, { GroupTransparency = 0 }):Play()
+				else
+					tweenservice:Create(content, MOTION.Slow, { GroupTransparency = 1 }):Play()
+					task.delay(0.25, function()
+						if not expanded then content.Visible = false end
+					end)
+				end
 			end
 
 			barButton.MouseButton1Click:Connect(function()
@@ -2784,9 +3026,9 @@ end)
         else
             patchedSrc = patchedSrc:sub(1, ia - 1) .. CUSTOM_ELEMENTS .. patchedSrc:sub(ia)
         end
-        warn("[SydeLoader] custom elements (Segmented, RangeSlider) injected")
+        log("[SydeLoader] custom elements (Segmented, RangeSlider) injected")
     else
-        warn("[SydeLoader] could not find initelement guard loop - custom elements NOT injected")
+        log("[SydeLoader] could not find initelement guard loop - custom elements NOT injected")
     end
 
     -- Opsei privacy: strip Syde's settings "Privacy" tab (Discord OAuth
@@ -2801,19 +3043,62 @@ end)
             .. patchedSrc:sub(pp + #PRIVACY_LINE)
     end
 
-    local syde = loadstring(patchedSrc)()
-    if not syde then error("Syde failed to load") end
-    if pp then warn("[SydeLoader] settings Privacy tab stripped") else warn("[SydeLoader] Privacy tab anchor not found - tab may still show") end
-
     -- Opsei safety: wrap the settings-gear uptime heartbeat Set call in pcall
     -- so a missing Paragraph template never throws 60 frames/sec.
+    -- @@MOTION EDIT: this patch must run BEFORE loadstring() below. It was
+    -- previously applied after the source was already compiled + executed,
+    -- which made it dead code (the wrapped line never took effect).
     local UPTIME_LINE = 'uptimeParagraph:Set("Session Uptime: " .. formatted, ' .. "'Session UpTime')"
     local up = patchedSrc:find(UPTIME_LINE, 1, true)
     if up then
         patchedSrc = patchedSrc:sub(1, up - 1)
             .. "pcall(function() " .. UPTIME_LINE .. " end)"
             .. patchedSrc:sub(up + #UPTIME_LINE)
+        log("[SydeLoader] uptime heartbeat pcall-wrapped")
     end
+
+    -- Syde compares the parent against the executor's `gethui()` reference.
+    -- Some executors return an Instance proxy whose identity differs even
+    -- though the UI is still under the same container, which produces the
+    -- recurring "[SYDE] UI moved. Restoring..." warning. Capture the parent
+    -- actually assigned by Roblox and accept descendants of that container.
+    local PARENT_SETUP = "\t\tpcall(function()\n\t\t\tLibrary.Parent = coregui\n\t\tend)\n\n\t\t-- Ensure Library stays in CoreGui"
+    local ps = patchedSrc:find(PARENT_SETUP, 1, true)
+    if ps then
+        local PARENT_MARKER = "\n\n\t\t-- Ensure Library stays in CoreGui"
+        local parentSetupReplacement = PARENT_SETUP:sub(1, #PARENT_SETUP - #PARENT_MARKER)
+            .. "\n\t\tlocal __sydeExpectedParent = Library.Parent or coregui"
+            .. PARENT_MARKER
+        patchedSrc = patchedSrc:sub(1, ps - 1)
+            .. parentSetupReplacement
+            .. patchedSrc:sub(ps + #PARENT_SETUP)
+
+        local MOVE_CONDITION = "if Library.Parent ~= coregui then"
+        local mc = patchedSrc:find(MOVE_CONDITION, ps, true)
+        if mc then
+            patchedSrc = patchedSrc:sub(1, mc - 1)
+                .. "if Library.Parent ~= __sydeExpectedParent and not (__sydeExpectedParent and Library:IsDescendantOf(__sydeExpectedParent)) then"
+                .. patchedSrc:sub(mc + #MOVE_CONDITION)
+            log("[SydeLoader] CoreGui parent watcher made proxy-safe")
+        else
+            log("[SydeLoader] CoreGui watcher condition not found")
+        end
+    else
+        log("[SydeLoader] CoreGui parent setup not found")
+    end
+
+    -- Even proxy-safe, the watcher's identity check can misfire on Solara
+    -- (CoreGui wrapper identity differs per call, and IsDescendantOf of a
+    -- proxy returns false), spamming "UI moved. Restoring..." every second.
+    -- The restore itself is a harmless re-parent; drop the warnings. The
+    -- second needle is "Syde <U+3021> ..." spelled with byte escapes so
+    -- this file stays ASCII.
+    patchClone('warn("[SYDE] UI moved. Restoring...")', "do end")
+    patchClone('warn("Syde \227\128\161 UI moved. Restoring...")', "do end")
+
+    local syde = loadstring(patchedSrc)()
+    if not syde then error("Syde failed to load") end
+    if pp then log("[SydeLoader] settings Privacy tab stripped") else log("[SydeLoader] Privacy tab anchor not found - tab may still show") end
 
     -- Opsei accent: #93bafa instead of Syde's default pink.
     -- Set before Init so every element built from the theme (tab
@@ -2829,13 +3114,22 @@ end)
     -- Opsei-branded window
     local Window = syde:Init({
         Title = "OSPEI",
-        SubText = "Hood Rivals  v1.5-dev",
+        SubText = "Hood Rivals  v1.6",
     })
 
     -- boot toast: one-line confirmation that the suite is up
     pcall(function()
-        syde:Toast({ Content = "Ospei Hood Rivals v1.5-dev loaded", Duration = 3 })
+        syde:Toast({ Content = "Ospei Hood Rivals v1.6 loaded", Duration = 3 })
     end)
+
+    -- Gun-feel features need the game's weapon modules; if the executor
+    -- can't require them, say so once instead of letting the toggles look
+    -- broken.
+    if WMI.available == false then
+        pcall(function()
+            syde:Toast({ Content = "Weapon modules unavailable on this executor - gun-feel toggles are no-ops", Duration = 6 })
+        end)
+    end
 
     local Tabs = {}
     local function Tab(title)
@@ -2848,6 +3142,7 @@ end)
     local function onToggle(key, apply)
         return function(v)
             CFG[key] = v
+            if DEBUG then log("[Ospei] toggle " .. key .. " -> " .. tostring(v)) end
             if apply then pcall(apply, v) end
             saveCfg()
         end
@@ -3077,7 +3372,13 @@ end)
                     Title = "Unload OSPEI?",
                     Content = "All features will turn off and the UI will close.",
                     ConfimCallBack = function()
-                        if _G.Ospei_HoodRivals_Unload then _G.Ospei_HoodRivals_Unload() end
+                        -- Deferred: syde's closeModal() keeps touching the
+                        -- modal + dim right after this callback returns
+                        -- (0.45s modal fade + 0.7s dim fade); tearing down
+                        -- earlier makes it index a destroyed ScreenGui.
+                        task.delay(1.5, function()
+                            if _G.Ospei_HoodRivals_Unload then _G.Ospei_HoodRivals_Unload() end
+                        end)
                     end,
                 })
             end)
@@ -3089,15 +3390,67 @@ end)
     -----------------------------------------------------------------
     -- (no-op in v1; dropdowns are the single source of truth for enums)
 
+    -- Keep the exact ScreenGui returned by the current Syde instance. The
+    -- detector scan alone is not sufficient when an executor wraps CoreGui
+    -- or when the UI was created before the marker was added.
+    local sydeRoot
+    pcall(function()
+        if Window and Window:IsA("ScreenGui") then
+            sydeRoot = Window
+        elseif Window then
+            sydeRoot = Window:FindFirstAncestorOfClass("ScreenGui")
+        end
+    end)
+
     api.destroy = function()
+        -- Disconnect Syde-managed global input/render connections before
+        -- destroying the instances. This makes a re-run idempotent instead
+        -- of leaving callbacks owned by the previous source load alive.
         pcall(function()
-            local parent = (gethui and gethui()) or game:GetService("CoreGui")
-            for _, child in ipairs(parent:GetChildren()) do
-                if child:IsA("ScreenGui") and child:FindFirstChild("SYDEUIDetector") then
-                    child:Destroy()
+            local tracked = api.syde and api.syde.Connections
+            if type(tracked) == "table" then
+                for i = #tracked, 1, -1 do
+                    local data = tracked[i]
+                    local connection = type(data) == "table" and (data.Connection or data.connection) or data
+                    if connection and connection.Disconnect then
+                        pcall(function() connection:Disconnect() end)
+                    end
+                    tracked[i] = nil
                 end
             end
         end)
+
+        local seen = {}
+        local function destroyRoot(root)
+            if not root or seen[root] then return end
+            seen[root] = true
+            pcall(function() root:Destroy() end)
+        end
+
+        destroyRoot(sydeRoot)
+
+        -- Also remove stale Syde roots from prior runs. Query both the
+        -- ordinary CoreGui and gethui when the executor exposes it; each
+        -- call is protected because some executors revoke the hidden UI
+        -- reference during teardown.
+        local parents = { CoreGui }
+        pcall(function()
+            if typeof(gethui) == "function" then
+                local hidden = gethui()
+                if hidden and hidden ~= CoreGui then
+                    table.insert(parents, hidden)
+                end
+            end
+        end)
+        for _, parent in ipairs(parents) do
+            pcall(function()
+                for _, child in ipairs(parent:GetChildren()) do
+                    if child:IsA("ScreenGui") and child:FindFirstChild("SYDEUIDetector") then
+                        destroyRoot(child)
+                    end
+                end
+            end)
+        end
     end
 
     return api
@@ -3163,7 +3516,7 @@ connect(RunService.RenderStepped, function(dt)
     survivalStep()
     medkitStep()
     WMI.step()
-    FovRing.update()
+    FovRing.update(dt)
     Crosshair.update()
     updateEspBoxes(dt)
 end)
@@ -3175,12 +3528,15 @@ if _G.Ospei_HoodRivals_Unload then pcall(_G.Ospei_HoodRivals_Unload) end
 _G.Ospei_HoodRivals_Unload = function()
     if not Runtime.live then return end
     Runtime.live = false
-    saveCfg()
-    if CFG.noClip then applyNoClip(false) end
-    destroyEsp()
-    FovRing.destroy()
-    Crosshair.destroy()
-    Hitmarker.destroy()
+    -- Every step is pcall'd: a throw mid-teardown must not skip the
+    -- connection-disconnect loop below, or the RenderStepped loops (trigger
+    -- bot, ESP, movement) keep firing against a dead UI.
+    pcall(saveCfg)
+    if CFG.noClip then pcall(applyNoClip, false) end
+    pcall(destroyEsp)
+    pcall(FovRing.destroy)
+    pcall(Crosshair.destroy)
+    pcall(Hitmarker.destroy)
     pcall(function() EspGui:Destroy() end)
     pcall(WMI.destroy)
     pcall(SydeUI.destroy)
